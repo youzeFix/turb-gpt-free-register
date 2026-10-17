@@ -1138,41 +1138,67 @@ def _submit_email_and_wait_next(
     raise RuntimeError(f"邮箱提交后未进入密码页/验证码页，最后状态={last_state}")
 
 
-def _type_otp(driver, code: str) -> None:
+def _locate_otp_input(driver):
+    """返回 OTP 输入元素（单框或分格组），找不到返回 None。"""
     from selenium.webdriver.common.by import By
 
-    for refresh_retry in range(_MISSING_PAGE_ELEMENT_REFRESH_RETRIES + 1):
-        # 单输入框
-        for selector in [
-            "input[autocomplete='one-time-code']",
-            "input[name='code']",
-            "input[inputmode='numeric']",
-            "input[type='tel']",
-        ]:
-            els = [e for e in driver.find_elements(By.CSS_SELECTOR, selector) if _visible(e)]
-            if len(els) == 1:
-                _human_type_text(driver, els[0], code, clear=True)
-                return
+    for selector in [
+        "input[autocomplete='one-time-code']",
+        "input[name='code']",
+        "input[inputmode='numeric']",
+        "input[type='tel']",
+    ]:
+        els = [e for e in driver.find_elements(By.CSS_SELECTOR, selector) if _visible(e)]
+        if len(els) == 1:
+            return "single", els
 
-        # 6 个分格输入框
-        boxes = [e for e in driver.find_elements(By.CSS_SELECTOR, "input") if _visible(e)]
-        numeric_boxes = []
-        for e in boxes:
-            attrs = " ".join(str(e.get_attribute(k) or "") for k in ("inputmode", "autocomplete", "aria-label", "name", "id", "type"))
-            if any(x in attrs.lower() for x in ("numeric", "one-time", "code", "otp", "tel")):
-                numeric_boxes.append(e)
-        if len(numeric_boxes) >= len(code):
-            for e, ch in zip(numeric_boxes, code):
-                if _browser_actions_enabled():
-                    _human_scroll_to(driver, e)
-                    time.sleep(random.uniform(0.04, 0.18))
-                e.send_keys(ch)
-                if _browser_actions_enabled():
-                    human_delay("keystroke")
+    boxes = [e for e in driver.find_elements(By.CSS_SELECTOR, "input") if _visible(e)]
+    numeric_boxes = []
+    for e in boxes:
+        attrs = " ".join(str(e.get_attribute(k) or "") for k in ("inputmode", "autocomplete", "aria-label", "name", "id", "type"))
+        if any(x in attrs.lower() for x in ("numeric", "one-time", "code", "otp", "tel")):
+            numeric_boxes.append(e)
+    if numeric_boxes:
+        return "split", numeric_boxes
+    return None
+
+
+def _type_otp(driver, code: str) -> None:
+    # 页面通常已经停在 /email-verification，只是 React 还没渲染出输入框。
+    # 此时刷新会丢弃已到达的页面状态，在慢节点上反而更慢（曾经出现
+    # 「连续 3 次、每次间隔 2 秒就刷新」把页面越刷越慢）。所以先只等不刷，
+    # 累计约 25s 还找不到才进入刷新重试。
+    wait_deadline = time.time() + 25
+    while True:
+        found = _locate_otp_input(driver)
+        if found and (found[0] == "single" or len(found[1]) >= len(code)):
+            kind, els = found
+            break
+        if time.time() >= wait_deadline:
+            break
+        time.sleep(0.5)
+
+    for refresh_retry in range(_MISSING_PAGE_ELEMENT_REFRESH_RETRIES + 1):
+        if found:
+            if kind == "single":
+                _human_type_text(driver, els[0], code, clear=True)
+            else:
+                for e, ch in zip(els, code):
+                    if _browser_actions_enabled():
+                        _human_scroll_to(driver, e)
+                        time.sleep(random.uniform(0.04, 0.18))
+                    e.send_keys(ch)
+                    if _browser_actions_enabled():
+                        human_delay("keystroke")
             return
 
         if not _refresh_after_missing_page_element(driver, "OTP输入框", refresh_retry):
             break
+        # 刷新后必须等页面重新渲染，不能只等 1.5s 就再刷一次。
+        time.sleep(4.0)
+        found = _locate_otp_input(driver)
+        if found and (found[0] == "single" or len(found[1]) >= len(code)):
+            kind, els = found
 
     raise RuntimeError(
         f"找不到 OTP 输入框，已刷新重试{_MISSING_PAGE_ELEMENT_REFRESH_RETRIES}次"
@@ -1805,7 +1831,9 @@ def _click_continue_with_password_if_present(driver) -> dict:
           ].join(' ').toLowerCase();
           const text = norm(el.innerText || el.textContent || '');
           const passwordContinue = /continuewithpassword|continuewithapassword|usepasswordtocontinue|continueusingpassword/.test(text)
-            || /密码.*继续|密碼.*繼續|비밀번호.*계속|パスワード.*続行|パスワード.*つづける/.test(text);
+            // 日文实页文案是「パスワードで続ける」（続け），不是「続行」也不是
+            // 「つづける」；这里同时覆盖 続行/続ける/つづける 三种写法。
+            || /密码.*继续|密碼.*繼續|비밀번호.*계속|パスワード.*(?:続行|続ける|つづける)/.test(text);
           return (
             href.includes('/create-account/password') ||
             attrs.includes('/create-account/password') ||
@@ -1900,7 +1928,13 @@ def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str
             logger.info("%s 当前是登录密码页但未找到一次性验证码入口，跳过密码填写并交给 OTP 阶段：state=%s", _log_prefix(driver), last)
             return None
         password = _registration_password()
-        logger.info("%s 检测到 create-account/password，准备设置密码（%s 位）：email=%s", _log_prefix(driver), len(password), email)
+        # 密码一旦生成就必须留下可恢复的痕迹：账号在 OpenAI 侧此时已经创建，
+        # 如果后续 OTP / 资料页 / 取 token 任一步失败或被手动停止，
+        # save_account_data() 不会执行，密码会随进程一起丢失且无法找回。
+        logger.info(
+            "%s 检测到 create-account/password，已生成本次注册密码（%s 位）：email=%s password=%s",
+            _log_prefix(driver), len(password), email, password,
+        )
         result = driver.execute_script(r"""
         const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
           && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'

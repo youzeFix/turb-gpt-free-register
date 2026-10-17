@@ -19,6 +19,82 @@ class CloakOpenResult:
     raw: dict | None = None
 
 
+# Selenium 的 execute_script 可以把 WebElement 原样带回 Python；Playwright 的
+# json_value() 做不到 —— 嵌在对象里的 DOM 节点会丢失。共享流程有多处依赖
+# “JS 定位元素 → Python 再点击”，因此统一在 JS 侧给命中的节点打一个临时标记，
+# 回传标记 id，Python 侧再按标记还原成 CloakElement。
+_MARK_ATTR = "data-cloak-auto"
+_MARK_KEY = "__cloak_el__"
+
+_MARK_BODY_JS = r"""
+  const __payload = arguments[0] || {};
+  const __script = __payload.script;
+  const __args = __payload.args || [];
+  let __seq = 0;
+  const __tag = (v, depth) => {
+    if (depth > 6 || v === null || v === undefined) return v;
+    if (typeof v !== 'object') return v;
+    if (v instanceof Node) {
+      if (!v.hasAttribute('%(attr)s')) {
+        v.setAttribute('%(attr)s', 'c' + (++__seq));
+      }
+      return {%(key)s: v.getAttribute('%(attr)s')};
+    }
+    if (Array.isArray(v)) return v.map((x) => __tag(x, depth + 1));
+    const out = {};
+    for (const k of Object.keys(v)) {
+      try { out[k] = __tag(v[k], depth + 1); } catch (e) { out[k] = null; }
+    }
+    return out;
+  };
+  const __fn = new Function(...__args.map((_, i) => 'a' + i), __script);
+  return __tag(__fn(...__args), 0);
+""" % {"attr": _MARK_ATTR, "key": _MARK_KEY}
+
+
+def _element_by_marker(page: Any, marker: str) -> Any:
+    try:
+        return CloakElement(page, locator=page.locator(f'[{_MARK_ATTR}="{marker}"]'))
+    except Exception:
+        return None
+
+
+def _revive_marked_elements(page: Any, value: Any) -> Any:
+    """把 JS 回传的标记还原为 CloakElement，并清理临时属性。"""
+    found: list[str] = []
+
+    def walk(v: Any) -> Any:
+        if isinstance(v, dict):
+            if len(v) == 1 and _MARK_KEY in v:
+                marker = str(v[_MARK_KEY])
+                found.append(marker)
+                return _element_by_marker(page, marker)
+            return {k: walk(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        if isinstance(v, tuple):
+            return tuple(walk(x) for x in v)
+        return v
+
+    revived = walk(value)
+    # 标记属性不能留在页面上，否则会成为可被站点脚本观测的额外痕迹。
+    # 注意：execute_script 的入参要按 Selenium 风格用 arguments[] 读取。
+    if found:
+        try:
+            page.evaluate(
+                "const __attr = arguments[0];"
+                "const __ids = arguments[1] || [];"
+                "for (const __id of __ids) {"
+                "  document.querySelectorAll('[' + __attr + '=\"' + __id + '\"]')"
+                "    .forEach((__n) => __n.removeAttribute(__attr));"
+                "}",
+                [_MARK_ATTR, found],
+            )
+        except Exception:
+            pass
+    return revived
+
+
 class CloakElement:
     def __init__(self, page, locator=None, handle=None):
         self.page = page
@@ -82,6 +158,23 @@ class CloakElement:
             return str(self._eval("el => el.tagName.toLowerCase()") or "")
         except Exception:
             return ""
+
+    @property
+    def text(self) -> str:
+        """Selenium WebElement.text 的可见文本。
+
+        共享流程会读 ``el.text`` 来做日志与兜底匹配（例如重新发送按钮），
+        缺少该属性会让 Cloak 路径在点击前就抛 AttributeError。
+        优先 innerText（与真实可见文本一致），失败再退回 textContent。
+        """
+        for expr in ("el => el.innerText", "el => el.textContent", "el => el.value"):
+            try:
+                value = self._eval(expr)
+            except Exception:
+                continue
+            if value is not None and str(value).strip():
+                return str(value)
+        return ""
 
     def send_keys(self, *values: str) -> None:
         # 兼容 Selenium: el.send_keys(Keys.COMMAND, 'a')。
@@ -269,7 +362,7 @@ class CloakSeleniumDriver:
         if element is not None:
             return CloakElement(page, handle=element)
         try:
-            return handle.json_value()
+            return _revive_marked_elements(page, handle.json_value())
         except Exception as exc:
             msg = str(exc)
             if "Execution context was destroyed" in msg or "navigation" in msg.lower():
@@ -308,12 +401,13 @@ class CloakSeleniumDriver:
                 result = self.page.evaluate(wrapper, {"script": script, "args": serial_args})
             if isinstance(result, dict) and result.get("__cloak_timeout"):
                 raise TimeoutError("execute_async_script timeout")
-            return result
+            return _revive_marked_elements(self.page, result)
 
         # Selenium 脚本经常以 `return ...` 为主体；用 Function 保持语义。
-        wrapper = """({script, args}) => {
-          const fn = new Function(...args.map((_, i) => 'a' + i), script);
-          return fn(...args);
+        # 同步路径必须走 _MARK_JS，让嵌在返回值里的 DOM 节点能被还原。
+        wrapper = """(payload) => {
+          const fn = new Function(...payload.args.map((_, i) => 'a' + i), payload.script);
+          return fn(...payload.args);
         }"""
         element_wrapper = """(el, payload) => {
           const args = [el, ...payload.args];
@@ -323,7 +417,10 @@ class CloakSeleniumDriver:
         if first_el is not None:
             handle = first_el._eval_handle(element_wrapper, {"script": script, "args": serial_args})
         else:
-            handle = self.page.evaluate_handle(wrapper, {"script": script, "args": serial_args})
+            handle = self.page.evaluate_handle(
+                "function(payload) {" + _MARK_BODY_JS + "}",
+                {"script": script, "args": serial_args},
+            )
         return self._unwrap_js_result(self.page, handle)
 
 
