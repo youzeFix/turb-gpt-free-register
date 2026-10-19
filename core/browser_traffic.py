@@ -1189,15 +1189,14 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
                 )
                 continue
 
-            values = self._request_size_values(request) or {}
-            if values:
-                upload = (values.get("requestBodySize") or 0) + (values.get("requestHeadersSize") or 0)
-                download = (values.get("responseBodySize") or 0) + (values.get("responseHeadersSize") or 0)
-                include_response = True
-            else:
-                upload = self._request_fallback_upload(request)
-                download = 0
-                include_response = False
+            # 未完成的请求不能调 sizes()：Playwright 的 sizes() 内部会等待
+            # request.response()，对一直挂起的请求（长轮询 / SSE / keep-alive）
+            # 会无限期阻塞，把整个注册任务挂死且停止信号送不进去。
+            # 未完成的请求本来就没有响应体大小，直接用上传估算即可。
+            upload = self._request_fallback_upload(request)
+            download = 0
+            values: dict[str, int | None] = {}
+            include_response = False
             self._record_playwright_detail(
                 request,
                 request_id=key,

@@ -1727,14 +1727,27 @@ def _resubmit_signup_password_form(driver) -> dict:
         const input = [...document.querySelectorAll('input[type="password"],input[name*="password" i],input[autocomplete="new-password"]')]
           .find(visible);
         const form = input?.closest('form');
-        const button = form ? [...form.querySelectorAll('button[type="submit"],input[type="submit"],button')]
+        const button = form ? [...form.querySelectorAll('button[type="submit"],input[type="submit"],button:not([type="button"])')]
           .find(el => visible(el) && !el.disabled && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true') : null;
+        // requestSubmit(btn) 要求 btn 必须是 submit 按钮；显式 type="button" 的
+        // <button> 传进去会抛 TypeError，导致这条兜底路径自己先崩掉。
+        const isSubmitEl = el => {
+          if (!el) return false;
+          const tag = (el.tagName || '').toUpperCase();
+          const type = String(el.getAttribute('type') || '').toLowerCase();
+          if (tag === 'BUTTON') return type !== 'button';
+          if (tag === 'INPUT') return type === 'submit' || type === 'image';
+          return false;
+        };
         const errors = [...document.querySelectorAll('[role="alert"],[aria-live="assertive"],[aria-live="polite"],.react-aria-FieldError,[slot="errorMessage"],[class*="error"]')]
           .filter(visible).map(el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 10);
         if (!input || !form) return {ok:false, reason:'missing_password_form', url:location.href, errors};
         if (!String(input.value || '')) return {ok:false, reason:'empty_password', url:location.href, errors};
         if (errors.length) return {ok:false, reason:'page_errors', url:location.href, errors};
-        if (typeof form.requestSubmit === 'function') form.requestSubmit(button || undefined);
+        if (typeof form.requestSubmit === 'function') {
+          if (button && isSubmitEl(button)) form.requestSubmit(button);
+          else form.requestSubmit();
+        }
         else if (button) button.click();
         else form.submit();
         return {ok:true, reason:'form_requestSubmit', url:location.href, valueLength:String(input.value || '').length};

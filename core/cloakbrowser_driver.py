@@ -455,7 +455,14 @@ def _detect_cloak_exit_geo(proxy_url: str | None = None) -> dict:
                 timezone = timezone.get("id") or timezone.get("name")
             geo = {
                 "ip": data.get("ip") or data.get("query"),
-                "country": (data.get("country") or data.get("country_code") or data.get("countryCode") or "").upper(),
+                # 必须优先取 ISO 代码：ipinfo.io 的 country 本身就是 "JP"，
+                # 但 ipapi.co / ipwho.is 的 country 是全名 "Japan"。取全名会让
+                # build_browser_environment 查 COUNTRY_LOCALE_PROFILE_MAP 落空并
+                # 回落到 en-US，出现「en-US 语言 + Asia/Tokyo 时区」的自相矛盾画像。
+                "country": _normalize_country_code(
+                    data.get("country_code") or data.get("countryCode")
+                    or data.get("country") or ""
+                ),
                 "region": data.get("region") or data.get("regionName"),
                 "city": data.get("city"),
                 "timezone": timezone or "",
@@ -470,6 +477,27 @@ def _detect_cloak_exit_geo(proxy_url: str | None = None) -> dict:
         except Exception as exc:
             logger.debug("[Cloak] 出口 IP 地理检测失败 endpoint=%s: %s: %s", url, type(exc).__name__, exc)
     return {}
+
+
+def _normalize_country_code(value: str) -> str:
+    """把 GeoIP 返回的国家标识统一成 ISO 3166-1 alpha-2 大写码。
+
+    协议驱动走 BrowserSession._normalize_geo_response，那里已有同样的归一化；
+    这里独立实现一份，避免 core.session <-> core.cloakbrowser_driver 循环导入。
+    """
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    if len(text) == 2 and text.isalpha():
+        return text
+    try:
+        from core.session import BrowserSession
+    except Exception:
+        return text
+    try:
+        return str(BrowserSession._normalize_geo_response({"country": text}).get("country") or text)
+    except Exception:
+        return text
 
 
 def _build_cloak_locale_options(proxy_url: str | None = None) -> dict:
