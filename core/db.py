@@ -3514,6 +3514,25 @@ def get_domain_email_by_email(email: str) -> dict | None:
         return dict(row) if row else None
 
 
+def count_domain_emails_by_domain() -> dict[str, int]:
+    """统计域名邮箱池中每个域名已登记的地址数量。
+
+    多域名轮换时用它在各域名之间做负载均衡：哪个域名用得少就优先出哪个，
+    这样单个域名被 OpenAI 拒收后，把流量切到别的域名即可继续跑。
+    """
+    counts: dict[str, int] = {}
+    with _LOCK:
+        for row in _load_domain_pool():
+            email = str(row.get("email") or "").strip().lower()
+            if "@" not in email:
+                continue
+            domain = email.rsplit("@", 1)[1]
+            if not domain:
+                continue
+            counts[domain] = counts.get(domain, 0) + 1
+    return counts
+
+
 def list_domain_email_pool(status: str | None = None, limit: int = 500) -> list[dict]:
     return list_email_pool_page(
         source="cloudflare_domain", status=status, limit=limit, offset=0

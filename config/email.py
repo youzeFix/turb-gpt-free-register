@@ -71,6 +71,8 @@ IMAP_SOCKET_TIMEOUT = 10
 
 # 你的 Cloudflare 域名，如 "mydomain.com"
 # 注册时会自动生成 random@mydomain.com 作为注册邮箱
+# 可以填多个域名（逗号/分号/空格分隔），程序按已用地址数最少轮换；
+# 某个域名被 OpenAI 拒收后，把流量切到下一个域名即可继续跑。
 EMAIL_DOMAIN = ""
 
 # QQ 邮箱 IMAP 服务器地址（固定为 imap.qq.com）

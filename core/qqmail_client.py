@@ -12,6 +12,7 @@ import imaplib
 import email as email_lib
 import logging
 import random
+import re
 import string
 import time
 from datetime import datetime, timezone
@@ -216,24 +217,54 @@ def _search_messages(mail: imaplib.IMAP4_SSL, after_dt: datetime | None = None) 
 # 公共接口
 # ============================================================
 
-def pick_domain_email() -> str:
-    """
-    生成一个随机的域名邮箱地址并记录到 DB。
-    格式：{8位随机数字母}@{EMAIL_DOMAIN}
-    """
-    from core.db import claim_next_domain_email
+def email_domains() -> list[str]:
+    """解析 EMAIL_DOMAIN，支持逗号/分号/空白分隔的多个域名。
 
-    domain = _email_cfg.EMAIL_DOMAIN
-    if not domain:
+    多个域名用于轮换：某个域名被 OpenAI 拒收后，把流量切到下一个域名即可
+    继续跑，不用改配置也不用重新部署。
+    """
+    raw = str(getattr(_email_cfg, "EMAIL_DOMAIN", "") or "")
+    domains: list[str] = []
+    for item in re.split(r"[,;\s]+", raw):
+        domain = item.strip().lower().lstrip("@")
+        if not domain or "." not in domain or " " in domain:
+            continue
+        if domain not in domains:
+            domains.append(domain)
+    return domains
+
+
+def pick_email_domain() -> str:
+    """按各域名已用地址数最少轮换；只有一个域名时直接返回它。"""
+    domains = email_domains()
+    if not domains:
         raise QQMailClientError(
             "EMAIL_DOMAIN 未配置，请在 config/email.py 中设置你的 Cloudflare 域名"
         )
+    if len(domains) == 1:
+        return domains[0]
 
+    from core.db import count_domain_emails_by_domain
+
+    counts = count_domain_emails_by_domain()
+    # 计数相同时按配置顺序，保证行为可预期
+    return min(domains, key=lambda d: (counts.get(d, 0), domains.index(d)))
+
+
+def pick_domain_email() -> str:
+    """
+    生成一个随机的域名邮箱地址并记录到 DB。
+    格式：{8位随机数字母}@{域名}
+    域名取自 EMAIL_DOMAIN（可配多个，按已用量最少轮换）。
+    """
+    from core.db import claim_next_domain_email
+
+    domain = pick_email_domain()
     prefix = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
     email = f"{prefix}@{domain}"
 
     claim_next_domain_email(email)
-    logger.info(f"[QQMail] 生成域名邮箱: {email}")
+    logger.info(f"[QQMail] 生成域名邮箱: {email}（域名池 {email_domains()}）")
     return email
 
 
@@ -308,9 +339,14 @@ def fetch_latest_otp(
             if not looks_like_openai_email(item):
                 continue
 
-            # 必须匹配收件地址（避免捡到其他域名地址的旧验证码）
-            to_field = (item.get("to") or "").lower()
-            if target_lower not in to_field:
+            # 必须匹配收件地址（避免捡到其他域名地址的旧验证码）。
+            # Cloudflare Email Routing 转发后，原始收件人可能出现在 To:、
+            # X-Original-To 或 Delivered-To 任意一个头里，三个都要看。
+            recipient_fields = " ".join(
+                str(item.get(key) or "").lower()
+                for key in ("to", "deliveredTo", "xOriginalTo")
+            )
+            if target_lower not in recipient_fields:
                 continue
 
             subject = item.get("subject") or ""

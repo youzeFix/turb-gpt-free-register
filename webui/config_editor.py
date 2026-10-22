@@ -415,7 +415,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "EMAIL_DOMAIN", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "转发域名(cloudflare_domain)", "help": "仅 cloudflare_domain 使用：Email Routing 的域名，如 mydomain.com；与 EMAIL_SOURCE=cloudflare 无关",
+        "label": "转发域名(cloudflare_domain)", "help": "仅 cloudflare_domain 使用：Email Routing 的域名，如 mydomain.com；可填多个（逗号分隔）自动轮换；与 EMAIL_SOURCE=cloudflare 无关",
     },
     {
         "key": "QQ_EMAIL", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
