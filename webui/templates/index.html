@@ -6376,6 +6376,49 @@ async function loadMailCodeCatalog(btn) {
     btn.disabled = false;
   }
 }
+const DOMAIN_PROBE_VERDICT = {
+  accepted: '✅ 可用',
+  rejected: '❌ 被 OpenAI 拒绝',
+  inconclusive: '⚠️ 无法判定',
+};
+const DOMAIN_PROBE_STAGE = {
+  input: '打开登录页',
+  email_submit: '邮箱提交',
+  register: '建号提交',
+  exception: '异常',
+};
+async function probeEmailDomains(btn) {
+  const output = btn.nextElementSibling;
+  const field = btn.closest('.fld')?.querySelector('input[data-key="EMAIL_DOMAIN"]');
+  const raw = (field?.value || '').trim();
+  const domains = raw.split(/[,;\s]+/).map(s => s.trim().toLowerCase()).filter(s => s && s.includes('.'));
+  if (!domains.length) {
+    output.hidden = false;
+    output.textContent = '请先在上面的输入框填写域名（多个用逗号分隔）';
+    return;
+  }
+  btn.disabled = true;
+  output.hidden = false;
+  output.textContent = `正在体检 ${domains.length} 个域名（会打开浏览器，耗时约 1~3 分钟/个）...`;
+  try {
+    const result = await api('/api/domain-probe', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ domains, check_register: true }),
+    });
+    if (!result.ok) throw new Error(result.error || '体检失败');
+    const lines = (result.results || []).map(r => {
+      const verdict = DOMAIN_PROBE_VERDICT[r.verdict] || r.verdict;
+      const stage = DOMAIN_PROBE_STAGE[r.stage] || r.stage;
+      return `${verdict}  ${r.domain}  [卡在${stage}]  ${r.detail || ''}  (${r.elapsed ?? '-'}s)`;
+    });
+    output.textContent = lines.join('\n');
+  } catch (e) {
+    output.textContent = '体检失败：' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
 function renderConfigExternalLink(f) {
   const url = String(f.external_url || '').trim();
   if (!/^https?:\/\//i.test(url)) return '';
@@ -6429,7 +6472,9 @@ function renderConfigPlainFieldV2(f) {
     : field;
   const mailCodeTools = f.key === 'MAILCODE_PRODUCT_ID'
     ? '<div><button type="button" class="btn" onclick="loadMailCodeCatalog(this)">查询商品与余额（请先保存密钥）</button><pre style="white-space:pre-wrap" hidden></pre></div>' : '';
-  return decorated + renderConfigRecommendedLinks(f) + mailCodeTools;
+  const domainProbeTools = f.key === 'EMAIL_DOMAIN'
+    ? '<div><button type="button" class="btn" onclick="probeEmailDomains(this)">域名体检（免费，不买邮箱不耗额度）</button><pre style="white-space:pre-wrap" hidden></pre></div>' : '';
+  return decorated + renderConfigRecommendedLinks(f) + mailCodeTools + domainProbeTools;
 }
 function renderMixedConfigSectionV2(name, fields, intro) {
   const slug = configGroupSlug(name);

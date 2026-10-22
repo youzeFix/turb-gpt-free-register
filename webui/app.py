@@ -2881,6 +2881,37 @@ def create_app(auth_code: str | None = None) -> Flask:
         except MailCodeError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
+    @app.post("/api/domain-probe")
+    def api_domain_probe():
+        """免费体检邮箱域名：判断某域名会不会被 OpenAI 拒绝。
+
+        不购买邮箱、不消耗取码额度；探测地址只是随机的 probe 地址。
+        """
+        data = request.get_json(silent=True) or {}
+        raw = data.get("domains")
+        if raw is None:
+            raw = data.get("domain")
+        if isinstance(raw, str):
+            raw = [item for item in raw.replace(";", ",").replace("|", ",").split(",")]
+        if not isinstance(raw, list):
+            raw = []
+        domains = [str(item).strip() for item in raw if str(item).strip()]
+        if not domains:
+            return jsonify({"ok": False, "error": "请至少填写一个域名"}), 400
+        if len(domains) > 10:
+            return jsonify({"ok": False, "error": "一次最多体检 10 个域名"}), 400
+
+        check_register = bool(data.get("check_register", True))
+        try:
+            from core.domain_probe import probe_domains
+            results = probe_domains(domains, check_register=check_register)
+        except Exception as exc:
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 500
+        return jsonify({
+            "ok": True,
+            "results": [item.to_dict() for item in results],
+        })
+
     @app.post("/api/cloudmail/gen-token")
     def api_cloudmail_gen_token():
         """手动生成 CloudMail Authorization Token，并把本次填写的 CloudMail 配置一并写入 .env。"""
