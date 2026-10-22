@@ -92,6 +92,44 @@ def _cache_busted_url(url: str, attempt: int) -> str:
         return url
 
 
+# 某些取码服务把 token 绑定在确切的 query 上，多加一个参数就会判定凭据非法
+# （iCloud Mail 网关就返回 401 INVALID_API_KEY）。这些地址命中后就不再加
+# 缓存破坏参数，避免整个取码流程一直空转。
+_NO_CACHE_BUSTER_URLS: set[str] = set()
+
+
+def _error_code(text: str) -> str:
+    """从错误响应体里取出稳定的业务错误码。"""
+    try:
+        payload = json.loads(text or "")
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    error = payload.get("error")
+    if isinstance(error, dict):
+        return str(error.get("code") or "").strip().upper()
+    return str(error or "").strip().upper()
+
+
+def _retry_after_seconds(resp) -> float:
+    """读取服务给的退避时间：Retry-After 秒 或 X-Retry-After-Ms 毫秒。"""
+    headers = getattr(resp, "headers", None) or {}
+    try:
+        raw_ms = headers.get("X-Retry-After-Ms")
+        if raw_ms:
+            return max(0.0, float(raw_ms) / 1000.0)
+    except (TypeError, ValueError):
+        pass
+    try:
+        raw = headers.get("Retry-After")
+        if raw:
+            return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        pass
+    return 0.0
+
+
 @dataclass
 class GenericApiEmailAccount:
     email: str
@@ -782,12 +820,14 @@ def fetch_latest_otp(
     )
 
     attempt = 0
+    reported_status: set[str] = set()
     while time.time() < deadline:
         attempt += 1
         try:
             # 不修改 yangyang 的路径型 URL；其列表接口本身按邮件 ID 返回数据。
             base_poll_url = public_inbox_api_url or account.code_url
-            poll_url = base_poll_url if is_yangyang else _cache_busted_url(base_poll_url, attempt)
+            use_buster = (not is_yangyang) and (base_poll_url not in _NO_CACHE_BUSTER_URLS)
+            poll_url = _cache_busted_url(base_poll_url, attempt) if use_buster else base_poll_url
             route_error: Exception | None = None
             page_result = yy_result = resp = None
             text = ""
@@ -937,7 +977,44 @@ def fetch_latest_otp(
                         else:
                             last_error = f"HTTP 200 但未提取到 6 位验证码，响应预览: {text[:160]}"
             else:
+                # 401 INVALID_API_KEY：多半是缓存破坏参数让服务判凭据非法。
+                # 立刻改用干净 URL 重试，并且记住这个地址不要再加参数。
+                if resp.status_code == 401 and _error_code(text) == "INVALID_API_KEY" and use_buster:
+                    _NO_CACHE_BUSTER_URLS.add(base_poll_url)
+                    logger.warning(
+                        "[GenericAPI] 取码接口对加了缓存破坏参数的 URL 返回 401 INVALID_API_KEY，"
+                        "改用原始 URL 重试（该地址后续不再附加 _otp_poll 参数）: %s",
+                        base_poll_url,
+                    )
+                    continue
+                # 429：令牌桶限流，按服务给的 Retry-After 退避，别当成"没有验证码"。
+                if resp.status_code == 429:
+                    wait = _retry_after_seconds(resp)
+                    if wait <= 0:
+                        wait = max(float(interval), 2.0)
+                    last_error = f"HTTP 429 限流（{_error_code(text) or 'RATE_LIMITED'}），{wait:.1f}s 后重试"
+                    status_key = "429"
+                    if status_key not in reported_status:
+                        reported_status.add(status_key)
+                        logger.warning(
+                            "[GenericAPI] 取码接口限流 HTTP 429: %s；按 Retry-After 退避 %.1fs",
+                            (text or "")[:160],
+                            wait,
+                        )
+                    remaining = int(deadline - time.time())
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(wait, remaining))
+                    continue
                 last_error = f"HTTP {resp.status_code}: {text[:160]}"
+                status_key = str(resp.status_code)
+                if status_key not in reported_status:
+                    reported_status.add(status_key)
+                    logger.warning(
+                        "[GenericAPI] 取码接口返回 HTTP %s: %s",
+                        resp.status_code,
+                        (text or "")[:200],
+                    )
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
 
@@ -957,8 +1034,8 @@ def fetch_latest_otp(
             )
         else:
             logger.info(
-                f"[GenericAPI] 暂未从取码接口拿到验证码，"
-                f"{interval}s 后重试（剩余 {remaining}s）..."
+                f"[GenericAPI] 暂未从取码接口拿到验证码"
+                f"（{last_error or '接口无验证码'}），{interval}s 后重试（剩余 {remaining}s）..."
             )
         time.sleep(interval)
 
