@@ -133,6 +133,9 @@ def _request(
 
     url = _base_url() + (path if str(path).startswith("/") else f"/{path}")
     try:
+        # 不继承系统代理：邮箱 API 国内直连即可，不应该和 OpenAI 流量抢同一个
+        # 代理节点。系统代理开着时（Windows 代理 / Clash TUN），节点一抖动，
+        # 取码请求就会以 SSL EOF 失败，验证码直接收不到。
         response = requests.request(
             method.upper(),
             url,
@@ -140,6 +143,7 @@ def _request(
             json=json_body,
             headers=request_headers,
             timeout=_request_timeout(),
+            proxies={"http": None, "https": None},
         )
     except requests.RequestException as exc:
         raise RemailError(f"Remail 请求失败 ({method.upper()} {path}): {type(exc).__name__}: {exc}") from exc
