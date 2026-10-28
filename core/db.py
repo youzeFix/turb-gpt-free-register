@@ -9,7 +9,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -76,10 +76,19 @@ def _sqlite_conn() -> sqlite3.Connection:
     """创建短生命周期连接；WAL 允许 WebUI 读与注册线程写并行。"""
     _ensure_storage()
     conn = sqlite3.connect(str(_active_sqlite_path()), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    try:
+        conn.row_factory = sqlite3.Row
+        # SQLite 内置 LOWER 只处理 ASCII；保持历史 Python str.lower 的邮箱匹配语义。
+        conn.create_function("account_email_lower", 1, lambda value: str(value or "").lower(), deterministic=True)
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except BaseException:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
     return conn
 
 
@@ -119,212 +128,238 @@ def _ensure_sqlite() -> None:
         active_path = _active_sqlite_path()
         if _SQLITE_READY and _SQLITE_READY_PATH == active_path:
             return
-        conn = _sqlite_conn()
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS accounts (
-                id INTEGER NOT NULL,
-                email TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT '',
-                archived INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL DEFAULT '',
-                payload TEXT NOT NULL,
-                PRIMARY KEY (id)
-            );
-            CREATE TABLE IF NOT EXISTS email_pool (
-                id INTEGER PRIMARY KEY,
-                email TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT '', archived INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '',
-                payload TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS registration_jobs AS SELECT * FROM accounts WHERE 0;
-            CREATE TABLE IF NOT EXISTS codex_accounts (
-                id INTEGER PRIMARY KEY,
-                filename TEXT NOT NULL UNIQUE, email TEXT NOT NULL DEFAULT '',
-                archived INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT '',
-                updated_at TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS codex_agent_accounts (
-                account_id INTEGER PRIMARY KEY,
-                email TEXT NOT NULL DEFAULT '', filename TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '',
-                payload TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS storage_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-        """)
-        for table in {"accounts", "email_pool", "registration_jobs"}:
-            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_status ON {table}(status, id DESC)")
-            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_archived ON {table}(archived, id DESC)")
-            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_email ON {table}(email COLLATE NOCASE)")
-            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_created ON {table}(created_at DESC)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_email_pool_source_status ON email_pool(source, status, id DESC)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_accounts_archived ON codex_accounts(archived, id DESC)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_accounts_email ON codex_accounts(email COLLATE NOCASE)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_accounts_created ON codex_accounts(created_at DESC)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_agent_accounts_email ON codex_agent_accounts(email COLLATE NOCASE)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_agent_accounts_updated ON codex_agent_accounts(updated_at DESC)")
-        migration_done = conn.execute(
-            "SELECT 1 FROM storage_meta WHERE key='legacy_import_completed' LIMIT 1"
-        ).fetchone()
-        # 迁移标记写入 SQLite，而不是依赖“表是否为空”。这样用户删除全部数据后，
-        # 重启也不会再次从旧 JSON 恢复已删除的数据。
-        if not migration_done:
-            sources = {
-                "accounts": (_ACCOUNTS_JSON, _LEGACY_ACCOUNTS_JSON),
-                "outlook": (_OUTLOOK_JSON, _LEGACY_OUTLOOK_JSON),
-                "generic_api": (_GENERIC_API_EMAIL_JSON,),
-                "jobs": (_JOBS_JSON, _LEGACY_JOBS_JSON),
-                "domain": (_DOMAIN_EMAIL_JSON,),
-            }
-            for collection, paths in sources.items():
-                table = _TABLES[collection]
-                exists = conn.execute(
-                    f"SELECT 1 FROM {table}" + (" WHERE source=?" if table == "email_pool" else " LIMIT 1"),
-                    ((_EMAIL_SOURCES[collection],) if table == "email_pool" else ()),
-                ).fetchone()
-                if exists:
-                    continue
-                rows = None
-            # 兼容上一版“records 单表 + collection”实现。
-                if _table_exists(conn, "records"):
-                    legacy = conn.execute("SELECT payload FROM records WHERE collection=? ORDER BY id", (collection,)).fetchall()
-                    if legacy:
-                        rows = [json.loads(item["payload"]) for item in legacy]
-            # 兼容上一版按邮箱来源拆分的三张表。
-                if collection in _EMAIL_SOURCES and rows is None:
-                    old_table = _LEGACY_TABLES[collection]
-                    if _table_exists(conn, old_table):
-                        legacy = conn.execute(f"SELECT payload FROM {old_table} ORDER BY id").fetchall()
+        with closing(_sqlite_conn()) as conn, conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id INTEGER NOT NULL,
+                    email TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY (id)
+                );
+                CREATE TABLE IF NOT EXISTS email_pool (
+                    id INTEGER PRIMARY KEY,
+                    email TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '', archived INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '',
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS registration_jobs AS SELECT * FROM accounts WHERE 0;
+                CREATE TABLE IF NOT EXISTS codex_accounts (
+                    id INTEGER PRIMARY KEY,
+                    filename TEXT NOT NULL UNIQUE, email TEXT NOT NULL DEFAULT '',
+                    archived INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS codex_agent_accounts (
+                    account_id INTEGER PRIMARY KEY,
+                    email TEXT NOT NULL DEFAULT '', filename TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '',
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS account_inspections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS one_active_account_inspection
+                    ON account_inspections ((1)) WHERE status IN ('queued', 'running');
+                CREATE TABLE IF NOT EXISTS account_inspection_snapshots (
+                    inspection_id INTEGER PRIMARY KEY,
+                    account_ids TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS account_inspection_failures (
+                    inspection_id INTEGER NOT NULL,
+                    account_id INTEGER NOT NULL,
+                    email TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error TEXT NOT NULL,
+                    failed_at TEXT NOT NULL,
+                    PRIMARY KEY (inspection_id, account_id)
+                );
+                CREATE TABLE IF NOT EXISTS storage_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+            """)
+            for table in {"accounts", "email_pool", "registration_jobs"}:
+                conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_status ON {table}(status, id DESC)")
+                conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_archived ON {table}(archived, id DESC)")
+                conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_email ON {table}(email COLLATE NOCASE)")
+                conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_created ON {table}(created_at DESC)")
+            # registration_jobs 由 CREATE TABLE AS 建立，id 并不是主键，需显式索引。
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_registration_jobs_id ON registration_jobs(id DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_registration_jobs_updated ON registration_jobs(updated_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_registration_jobs_root_status ON registration_jobs(CAST(json_extract(payload, '$.root_job_id') AS INTEGER), status, id DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_email_lower ON accounts(account_email_lower(email), id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_email_pool_source_status ON email_pool(source, status, id DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_accounts_archived ON codex_accounts(archived, id DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_accounts_email ON codex_accounts(email COLLATE NOCASE)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_accounts_created ON codex_accounts(created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_agent_accounts_email ON codex_agent_accounts(email COLLATE NOCASE)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_agent_accounts_updated ON codex_agent_accounts(updated_at DESC)")
+            migration_done = conn.execute(
+                "SELECT 1 FROM storage_meta WHERE key='legacy_import_completed' LIMIT 1"
+            ).fetchone()
+            # 迁移标记写入 SQLite，而不是依赖“表是否为空”。这样用户删除全部数据后，
+            # 重启也不会再次从旧 JSON 恢复已删除的数据。
+            if not migration_done:
+                sources = {
+                    "accounts": (_ACCOUNTS_JSON, _LEGACY_ACCOUNTS_JSON),
+                    "outlook": (_OUTLOOK_JSON, _LEGACY_OUTLOOK_JSON),
+                    "generic_api": (_GENERIC_API_EMAIL_JSON,),
+                    "jobs": (_JOBS_JSON, _LEGACY_JOBS_JSON),
+                    "domain": (_DOMAIN_EMAIL_JSON,),
+                }
+                for collection, paths in sources.items():
+                    table = _TABLES[collection]
+                    exists = conn.execute(
+                        f"SELECT 1 FROM {table}" + (" WHERE source=?" if table == "email_pool" else " LIMIT 1"),
+                        ((_EMAIL_SOURCES[collection],) if table == "email_pool" else ()),
+                    ).fetchone()
+                    if exists:
+                        continue
+                    rows = None
+                # 兼容上一版“records 单表 + collection”实现。
+                    if _table_exists(conn, "records"):
+                        legacy = conn.execute("SELECT payload FROM records WHERE collection=? ORDER BY id", (collection,)).fetchall()
                         if legacy:
                             rows = [json.loads(item["payload"]) for item in legacy]
-                for path in paths:
-                    if rows is None and path.exists():
-                        candidate = _read_json(path, None)
-                        if isinstance(candidate, list):
-                            rows = candidate
-                            break
-                if rows is None:
-                    rows = _read_legacy_sqlite_collection(collection)
-                if not rows:
-                    continue
-                next_email_id = int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM email_pool").fetchone()[0]) + 1 if table == "email_pool" else 0
-                for pos, row in enumerate(rows, 1):
-                    row = dict(row)
-                    rid = next_email_id if table == "email_pool" else int(row.get("id") or pos)
-                    if table == "email_pool":
-                        next_email_id += 1
-                    row["id"] = rid
+                # 兼容上一版按邮箱来源拆分的三张表。
+                    if collection in _EMAIL_SOURCES and rows is None:
+                        old_table = _LEGACY_TABLES[collection]
+                        if _table_exists(conn, old_table):
+                            legacy = conn.execute(f"SELECT payload FROM {old_table} ORDER BY id").fetchall()
+                            if legacy:
+                                rows = [json.loads(item["payload"]) for item in legacy]
+                    for path in paths:
+                        if rows is None and path.exists():
+                            candidate = _read_json(path, None)
+                            if isinstance(candidate, list):
+                                rows = candidate
+                                break
+                    if rows is None:
+                        rows = _read_legacy_sqlite_collection(collection)
+                    if not rows:
+                        continue
+                    next_email_id = int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM email_pool").fetchone()[0]) + 1 if table == "email_pool" else 0
+                    for pos, row in enumerate(rows, 1):
+                        row = dict(row)
+                        rid = next_email_id if table == "email_pool" else int(row.get("id") or pos)
+                        if table == "email_pool":
+                            next_email_id += 1
+                        row["id"] = rid
+                        conn.execute(
+                            f"INSERT OR REPLACE INTO {table}(id,email,source,status,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?,?)" if table == "email_pool" else
+                            f"INSERT OR REPLACE INTO {table}(id,email,status,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?)",
+                            ((rid, str(row.get("email") or ""), _EMAIL_SOURCES[collection], str(row.get("status") or ""),
+                              int(bool(row.get("archived"))), str(row.get("created_at") or row.get("imported_at") or ""),
+                              str(row.get("updated_at") or ""), json.dumps(row, ensure_ascii=False)) if table == "email_pool" else
+                             (rid, str(row.get("email") or ""), str(row.get("status") or ""),
+                              int(bool(row.get("archived"))), str(row.get("created_at") or row.get("imported_at") or ""),
+                              str(row.get("updated_at") or ""), json.dumps(row, ensure_ascii=False))),
+                        )
+            # 兼容早期 SQLite 版本的保存逻辑：当时写入 email_pool 时漏掉了
+            # source 列，导致通用 API 邮箱在“全部邮箱池”中没有类型，按来源筛选
+            # 也查不到。根据素材字段只修复可明确识别的历史行，避免误分类域名邮箱。
+            conn.execute(
+                "UPDATE email_pool SET source=? "
+                "WHERE (source IS NULL OR trim(source)='') AND ("
+                "json_extract(payload, '$.code_url') IS NOT NULL OR "
+                "json_extract(payload, '$.url') IS NOT NULL OR "
+                "json_extract(payload, '$.source') IN ('generic_api', 'generic-api') OR "
+                "json_extract(payload, '$.email_source') IN ('generic_api', 'generic-api')"
+                ")",
+                (_EMAIL_SOURCES["generic_api"],),
+            )
+            conn.execute(
+                "UPDATE email_pool SET source=? "
+                "WHERE (source IS NULL OR trim(source)='') AND ("
+                "json_extract(payload, '$.client_id') IS NOT NULL OR "
+                "json_extract(payload, '$.clientId') IS NOT NULL OR "
+                "json_extract(payload, '$.refresh_token') IS NOT NULL OR "
+                "json_extract(payload, '$.refreshToken') IS NOT NULL OR "
+                "json_extract(payload, '$.source') IN ('outlook', 'outlook_pool') OR "
+                "json_extract(payload, '$.email_source') = 'outlook'"
+                ")",
+                (_EMAIL_SOURCES["outlook"],),
+            )
+            # 域名邮箱的历史 payload 没有 client_id/code_url 等特征，剩余的空来源
+            # 记录只能归入域名邮箱池。否则它们会在“全部邮箱池”中显示为未知来源，
+            # 前端又会按 Outlook 处理，导致列表里能看到但删除/改状态找不到。
+            conn.execute(
+                "UPDATE email_pool SET source=? "
+                "WHERE (source IS NULL OR trim(source)='') AND COALESCE(("
+                "json_extract(payload, '$.code_url') IS NOT NULL OR "
+                "json_extract(payload, '$.url') IS NOT NULL OR "
+                "json_extract(payload, '$.source') IN ('generic_api', 'generic-api', 'outlook', 'outlook_pool') OR "
+                "json_extract(payload, '$.email_source') IN ('generic_api', 'generic-api', 'outlook') OR "
+                "json_extract(payload, '$.client_id') IS NOT NULL OR "
+                "json_extract(payload, '$.clientId') IS NOT NULL OR "
+                "json_extract(payload, '$.refresh_token') IS NOT NULL OR "
+                "json_extract(payload, '$.refreshToken') IS NOT NULL"
+                "), 0)=0",
+                (_EMAIL_SOURCES["domain"],),
+            )
+            # CPA Codex 凭证首次导入数据库；后续列表查询不再扫描 codex_accounts/ 文件。
+            if not migration_done and not conn.execute("SELECT 1 FROM codex_accounts LIMIT 1").fetchone() and _CODEX_DIR.exists():
+                state = _read_json(_LEGACY_CODEX_EXPORT_STATE, {})
+                state = state if isinstance(state, dict) else {}
+                for pos, path in enumerate(sorted(_CODEX_DIR.glob("codex-*.json")), 1):
+                    try:
+                        content = json.loads(path.read_text(encoding="utf-8"))
+                        stat = path.stat()
+                    except Exception:
+                        continue
+                    filename = path.name
+                    meta = dict(content)
+                    meta["_filename"] = filename
+                    meta["_size"] = stat.st_size
+                    meta["_mtime"] = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+                    es = state.get(filename) or {}
+                    meta["_exported_at"] = es.get("exported_at")
+                    meta["_exported_count"] = es.get("exported_count", 0)
+                    meta["_archived"] = bool(es.get("archived"))
                     conn.execute(
-                        f"INSERT OR REPLACE INTO {table}(id,email,source,status,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?,?)" if table == "email_pool" else
-                        f"INSERT OR REPLACE INTO {table}(id,email,status,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?)",
-                        ((rid, str(row.get("email") or ""), _EMAIL_SOURCES[collection], str(row.get("status") or ""),
-                          int(bool(row.get("archived"))), str(row.get("created_at") or row.get("imported_at") or ""),
-                          str(row.get("updated_at") or ""), json.dumps(row, ensure_ascii=False)) if table == "email_pool" else
-                         (rid, str(row.get("email") or ""), str(row.get("status") or ""),
-                          int(bool(row.get("archived"))), str(row.get("created_at") or row.get("imported_at") or ""),
-                          str(row.get("updated_at") or ""), json.dumps(row, ensure_ascii=False))),
+                        "INSERT OR IGNORE INTO codex_accounts(id,filename,email,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?)",
+                        (pos, filename, str(content.get("email") or ""), int(meta["_archived"]), meta["_mtime"], meta["_mtime"], json.dumps(meta, ensure_ascii=False)),
                     )
-        # 兼容早期 SQLite 版本的保存逻辑：当时写入 email_pool 时漏掉了
-        # source 列，导致通用 API 邮箱在“全部邮箱池”中没有类型，按来源筛选
-        # 也查不到。根据素材字段只修复可明确识别的历史行，避免误分类域名邮箱。
-        conn.execute(
-            "UPDATE email_pool SET source=? "
-            "WHERE (source IS NULL OR trim(source)='') AND ("
-            "json_extract(payload, '$.code_url') IS NOT NULL OR "
-            "json_extract(payload, '$.url') IS NOT NULL OR "
-            "json_extract(payload, '$.source') IN ('generic_api', 'generic-api') OR "
-            "json_extract(payload, '$.email_source') IN ('generic_api', 'generic-api')"
-            ")",
-            (_EMAIL_SOURCES["generic_api"],),
-        )
-        conn.execute(
-            "UPDATE email_pool SET source=? "
-            "WHERE (source IS NULL OR trim(source)='') AND ("
-            "json_extract(payload, '$.client_id') IS NOT NULL OR "
-            "json_extract(payload, '$.clientId') IS NOT NULL OR "
-            "json_extract(payload, '$.refresh_token') IS NOT NULL OR "
-            "json_extract(payload, '$.refreshToken') IS NOT NULL OR "
-            "json_extract(payload, '$.source') IN ('outlook', 'outlook_pool') OR "
-            "json_extract(payload, '$.email_source') = 'outlook'"
-            ")",
-            (_EMAIL_SOURCES["outlook"],),
-        )
-        # 域名邮箱的历史 payload 没有 client_id/code_url 等特征，剩余的空来源
-        # 记录只能归入域名邮箱池。否则它们会在“全部邮箱池”中显示为未知来源，
-        # 前端又会按 Outlook 处理，导致列表里能看到但删除/改状态找不到。
-        conn.execute(
-            "UPDATE email_pool SET source=? "
-            "WHERE (source IS NULL OR trim(source)='') AND COALESCE(("
-            "json_extract(payload, '$.code_url') IS NOT NULL OR "
-            "json_extract(payload, '$.url') IS NOT NULL OR "
-            "json_extract(payload, '$.source') IN ('generic_api', 'generic-api', 'outlook', 'outlook_pool') OR "
-            "json_extract(payload, '$.email_source') IN ('generic_api', 'generic-api', 'outlook') OR "
-            "json_extract(payload, '$.client_id') IS NOT NULL OR "
-            "json_extract(payload, '$.clientId') IS NOT NULL OR "
-            "json_extract(payload, '$.refresh_token') IS NOT NULL OR "
-            "json_extract(payload, '$.refreshToken') IS NOT NULL"
-            "), 0)=0",
-            (_EMAIL_SOURCES["domain"],),
-        )
-        # CPA Codex 凭证首次导入数据库；后续列表查询不再扫描 codex_accounts/ 文件。
-        if not migration_done and not conn.execute("SELECT 1 FROM codex_accounts LIMIT 1").fetchone() and _CODEX_DIR.exists():
-            state = _read_json(_LEGACY_CODEX_EXPORT_STATE, {})
-            state = state if isinstance(state, dict) else {}
-            for pos, path in enumerate(sorted(_CODEX_DIR.glob("codex-*.json")), 1):
-                try:
-                    content = json.loads(path.read_text(encoding="utf-8"))
-                    stat = path.stat()
-                except Exception:
-                    continue
-                filename = path.name
-                meta = dict(content)
-                meta["_filename"] = filename
-                meta["_size"] = stat.st_size
-                meta["_mtime"] = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
-                es = state.get(filename) or {}
-                meta["_exported_at"] = es.get("exported_at")
-                meta["_exported_count"] = es.get("exported_count", 0)
-                meta["_archived"] = bool(es.get("archived"))
-                conn.execute(
-                    "INSERT OR IGNORE INTO codex_accounts(id,filename,email,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?)",
-                    (pos, filename, str(content.get("email") or ""), int(meta["_archived"]), meta["_mtime"], meta["_mtime"], json.dumps(meta, ensure_ascii=False)),
-                )
-        # Agent 凭证也只在首次迁移时读取；运行期间完整内容保存在 SQLite。
-        if not migration_done and not conn.execute("SELECT 1 FROM codex_agent_accounts LIMIT 1").fetchone() and _CODEX_AGENT_DIR.exists():
-            for path in sorted(_CODEX_AGENT_DIR.glob("codex-agent-*.json")):
-                try:
-                    content = json.loads(path.read_text(encoding="utf-8"))
-                    stat = path.stat()
-                except Exception:
-                    continue
-                identity = content.get("agent_identity") if isinstance(content.get("agent_identity"), dict) else {}
-                email = str(content.get("email") or identity.get("email") or "").strip()
-                account = conn.execute("SELECT id, payload FROM accounts WHERE lower(email)=lower(?) LIMIT 1", (email,)).fetchone() if email else None
-                if not account:
-                    continue
-                account_id = int(account["id"])
-                stamp = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
-                conn.execute(
-                    "INSERT OR IGNORE INTO codex_agent_accounts(account_id,email,filename,created_at,updated_at,payload) VALUES(?,?,?,?,?,?)",
-                    (account_id, email or str(json.loads(account["payload"]).get("email") or ""), path.name, stamp, stamp, json.dumps(content, ensure_ascii=False)),
-                )
-                account_payload = json.loads(account["payload"])
-                account_payload.setdefault("codex_agent_token", json.dumps(content, ensure_ascii=False))
-                account_payload.pop("codex_agent_auth_path", None)
-                conn.execute("UPDATE accounts SET payload=?, updated_at=? WHERE id=?", (json.dumps(account_payload, ensure_ascii=False), stamp, account_id))
-        conn.commit()
-        # 迁移完成后删除旧的通用表，避免运行时继续依赖它。
-        for old_table in (*_LEGACY_TABLES.values(), "records"):
-            if _table_exists(conn, old_table) and old_table not in _TABLES.values():
-                conn.execute(f"DROP TABLE {old_table}")
-        if not migration_done:
-            conn.execute("INSERT OR REPLACE INTO storage_meta(key, value) VALUES('legacy_import_completed', ?)", (_now(),))
-        conn.commit()
-        conn.close()
+            # Agent 凭证也只在首次迁移时读取；运行期间完整内容保存在 SQLite。
+            if not migration_done and not conn.execute("SELECT 1 FROM codex_agent_accounts LIMIT 1").fetchone() and _CODEX_AGENT_DIR.exists():
+                for path in sorted(_CODEX_AGENT_DIR.glob("codex-agent-*.json")):
+                    try:
+                        content = json.loads(path.read_text(encoding="utf-8"))
+                        stat = path.stat()
+                    except Exception:
+                        continue
+                    identity = content.get("agent_identity") if isinstance(content.get("agent_identity"), dict) else {}
+                    email = str(content.get("email") or identity.get("email") or "").strip()
+                    account = conn.execute("SELECT id, payload FROM accounts WHERE lower(email)=lower(?) LIMIT 1", (email,)).fetchone() if email else None
+                    if not account:
+                        continue
+                    account_id = int(account["id"])
+                    stamp = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+                    conn.execute(
+                        "INSERT OR IGNORE INTO codex_agent_accounts(account_id,email,filename,created_at,updated_at,payload) VALUES(?,?,?,?,?,?)",
+                        (account_id, email or str(json.loads(account["payload"]).get("email") or ""), path.name, stamp, stamp, json.dumps(content, ensure_ascii=False)),
+                    )
+                    account_payload = json.loads(account["payload"])
+                    account_payload.setdefault("codex_agent_token", json.dumps(content, ensure_ascii=False))
+                    account_payload.pop("codex_agent_auth_path", None)
+                    conn.execute("UPDATE accounts SET payload=?, updated_at=? WHERE id=?", (json.dumps(account_payload, ensure_ascii=False), stamp, account_id))
+            conn.commit()
+            # 迁移完成后删除旧的通用表，避免运行时继续依赖它。
+            for old_table in (*_LEGACY_TABLES.values(), "records"):
+                if _table_exists(conn, old_table) and old_table not in _TABLES.values():
+                    conn.execute(f"DROP TABLE {old_table}")
+            if not migration_done:
+                conn.execute("INSERT OR REPLACE INTO storage_meta(key, value) VALUES('legacy_import_completed', ?)", (_now(),))
+            _reserve_account_id_floor(conn, int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM accounts").fetchone()[0]))
+            _reserve_job_id_floor(conn, int(conn.execute("SELECT COALESCE(MAX(id),0) FROM registration_jobs").fetchone()[0]))
+            _migrate_inspection_snapshots(conn)
         _SQLITE_READY = True
         _SQLITE_READY_PATH = active_path
 
@@ -348,6 +383,15 @@ def _save_collection(collection: str, rows: list[dict]) -> None:
     source = _EMAIL_SOURCES[collection] if table == "email_pool" else None
     with closing(_sqlite_conn()) as conn:
         with conn:
+            if table == "accounts":
+                # 全量重写账号表时也保留历史最大 ID；删除最后一个/全部账号不能重用 ID。
+                floor = max([int(r.get("id") or 0) for r in rows] + [
+                    int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM accounts").fetchone()[0])])
+                _reserve_account_id_floor(conn, floor)
+            if table == "registration_jobs":
+                floor = max([int(r.get("id") or 0) for r in rows] + [
+                    int(conn.execute("SELECT COALESCE(MAX(id),0) FROM registration_jobs").fetchone()[0])])
+                _reserve_job_id_floor(conn, floor)
             if table == "email_pool":
                 conn.execute("DELETE FROM email_pool WHERE source=?", (source,))
             else:
@@ -502,7 +546,15 @@ def _account_filter_sql(
                     f"({normalized_key} = ? OR {normalized_name} IN (?, ?, ?))"
                 )
                 condition_params.extend([canonical, canonical, f"{canonical}plan", f"chatgpt{canonical}plan"])
-            if promo_discount:
+            if promo_discount == "other":
+                # 仅收录明确有效的其他优惠比例，未知/无优惠不归入“其他”。
+                percentage = "json_extract(j.value, '$.metadata.discount.percentage')"
+                conditions.extend([
+                    "json_type(j.value, '$.metadata.discount.percentage') IN ('integer', 'real')",
+                    f"{percentage} > 0 AND {percentage} <= 100",
+                    f"{percentage} NOT IN (50, 100)",
+                ])
+            elif promo_discount:
                 try:
                     discount_value = float(promo_discount.rstrip("%"))
                 except ValueError:
@@ -585,6 +637,24 @@ def _read_json(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
+
+
+def _reserve_account_id_floor(conn, value: int) -> None:
+    conn.execute("""INSERT INTO storage_meta(key,value) VALUES('account_id_high_watermark',?)
+                    ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER),CAST(excluded.value AS INTEGER))""",
+                 (str(value),))
+
+
+def _next_account_id() -> int:
+    """事务内预留单调递增 ID，防止删除后旧任务操作到新账号。"""
+    _ensure_sqlite()
+    with closing(_sqlite_conn()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT value FROM storage_meta WHERE key='account_id_high_watermark'").fetchone()
+        existing = int(conn.execute("SELECT COALESCE(MAX(id),0) FROM accounts").fetchone()[0])
+        value = max(int(row[0]) if row else 0, existing) + 1
+        _reserve_account_id_floor(conn, value)
+        return value
 
 
 def _next_id(items: list[dict]) -> int:
@@ -794,6 +864,44 @@ def _load_accounts() -> list[dict]:
     return _load_collection("accounts")
 
 
+def _select_account(conn, acc_id: int | None = None, email: str | None = None) -> dict | None:
+    """按主键读取一行；兼容历史 ID / 邮箱 OR 匹配时的首个账号语义。"""
+    target_email = (email or "").lower()
+    if acc_id is not None and not target_email:
+        record = conn.execute("SELECT payload FROM accounts WHERE id=?", (int(acc_id),)).fetchone()
+    elif target_email:
+        record = conn.execute(
+            "SELECT payload FROM accounts WHERE id=? OR account_email_lower(email)=? ORDER BY id LIMIT 1",
+            (int(acc_id) if acc_id is not None else None, target_email),
+        ).fetchone()
+    else:
+        return None
+    return json.loads(record["payload"]) if record else None
+
+
+@contextmanager
+def _account_for_update(acc_id: int | None = None, email: str | None = None):
+    """调用方持有 _LOCK；只读改写目标行，不全量重写账号集合。
+
+    SQLite 事务覆盖领取校验与写回；异常自动回滚，不插入已删除账号。
+    """
+    _ensure_sqlite()
+    with closing(_sqlite_conn()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _select_account(conn, acc_id, email)
+        before = json.dumps(row, ensure_ascii=False)
+        yield row
+        if row is None or json.dumps(row, ensure_ascii=False) == before:
+            return
+        row["copy_line"] = _account_line(row)
+        conn.execute(
+            "UPDATE accounts SET email=?,status=?,archived=?,created_at=?,updated_at=?,payload=? WHERE id=?",
+            (str(row.get("email") or ""), str(row.get("status") or ""),
+             int(bool(row.get("archived"))), str(row.get("created_at") or row.get("imported_at") or ""),
+             str(row.get("updated_at") or ""), json.dumps(row, ensure_ascii=False), int(row["id"])),
+        )
+
+
 def _save_accounts(rows: list[dict]) -> None:
     for row in rows:
         row["copy_line"] = _account_line(row)
@@ -857,11 +965,12 @@ def _account_matches_plan_filter(row: dict, plan_filter: str | None = None) -> b
         promo_parts = f.split(":") if f.startswith("promo:") else []
         wanted = promo_parts[1].strip() if len(promo_parts) > 1 else ""
         discount_text = promo_parts[2].strip() if len(promo_parts) > 2 else ""
+        other_discount = discount_text == "other"
         try:
             wanted_discount = float(discount_text.rstrip("%")) if discount_text else None
         except ValueError:
             wanted_discount = None
-        if not wanted and wanted_discount is None:
+        if not wanted and wanted_discount is None and not other_discount:
             return True
 
         def normalize_promo_type(value: Any) -> str:
@@ -880,7 +989,13 @@ def _account_matches_plan_filter(row: dict, plan_filter: str | None = None) -> b
             discount = metadata.get("discount") if isinstance(metadata, dict) else {}
             percentage = discount.get("percentage") if isinstance(discount, dict) else None
             try:
-                discount_matches = wanted_discount is None or float(percentage) == wanted_discount
+                if other_discount:
+                    discount_matches = (
+                        type(percentage) in (int, float)
+                        and 0 < percentage <= 100 and percentage not in (50, 100)
+                    )
+                else:
+                    discount_matches = wanted_discount is None or float(percentage) == wanted_discount
             except (TypeError, ValueError):
                 discount_matches = False
             if type_matches and discount_matches:
@@ -1077,7 +1192,7 @@ def insert_account(
         extra_json = json.dumps(extra, ensure_ascii=False) if extra else None
 
         if existing is None:
-            row_id = _next_id(accounts)
+            row_id = _next_account_id()
             row = {
                 "id": row_id,
                 "email": email,
@@ -1283,16 +1398,10 @@ def claim_account_plan_check(
     acc_id: int | None = None,
     email: str | None = None,
     trigger: str = "manual",
+    *, run_id: str | None = None,
 ) -> bool:
     """原子占用账号的套餐查询；已有未超时查询时返回 False。"""
-    with _LOCK:
-        accounts = _load_accounts()
-        target_email = (email or "").lower()
-        row = next((
-            r for r in accounts
-            if (acc_id is not None and int(r.get("id") or 0) == int(acc_id))
-            or (target_email and (r.get("email") or "").lower() == target_email)
-        ), None)
+    with _LOCK, _account_for_update(acc_id, email) as row:
         if row is None:
             return False
 
@@ -1309,28 +1418,33 @@ def claim_account_plan_check(
 
         now = _now()
         row["plan_check_status"] = "queued"
+        row["plan_check_run_id"] = run_id
         row["plan_check_trigger"] = str(trigger or "manual")
         row["plan_check_queued_at"] = now
         row["plan_check_started_at"] = None
         row["plan_check_completed_at"] = None
         row["plan_check_error"] = None
         row["updated_at"] = now
-        _save_accounts(accounts)
         return True
 
 
-def mark_account_plan_check_running(acc_id: int) -> bool:
+def mark_account_plan_check_running(acc_id: int, *, run_id: str | None = None, expected_account: dict | None = None) -> bool:
     """把已排队的套餐查询标记为执行中。"""
-    with _LOCK:
-        accounts = _load_accounts()
-        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
+    with _LOCK, _account_for_update(acc_id) as row:
         if row is None or row.get("plan_check_status") not in {"queued", "running"}:
             return False
+        if run_id is not None and row.get("plan_check_run_id") not in (None, run_id):
+            return False
+        if not _matches_check_snapshot(row, expected_account):
+            row.update(plan_check_status="failed", plan_check_ok=False,
+                       plan_check_error="账号邮箱/AT 已变更，旧套餐任务已取消",
+                       plan_check_completed_at=_now(), updated_at=_now())
+            return False
         row["plan_check_status"] = "running"
+        row["plan_check_run_id"] = run_id
         row["plan_check_started_at"] = _now()
         row["plan_check_error"] = None
         row["updated_at"] = _now()
-        _save_accounts(accounts)
         return True
 
 
@@ -1354,18 +1468,37 @@ def recover_interrupted_plan_checks() -> int:
         return recovered
 
 
-def update_account_plan_check(acc_id: int | None = None, email: str | None = None, result: dict | None = None) -> bool:
+def _matches_check_snapshot(row: dict, expected: dict | None) -> bool:
+    """网络请求期间账号身份/AT 变化时，禁止旧结果覆盖新账号状态。调用方持有 _LOCK。"""
+    if expected is None:
+        return True
+    for key in ("email", "access_token"):
+        if key not in expected:
+            continue
+        current, previous = str(row.get(key) or ""), str(expected.get(key) or "")
+        if key == "email":
+            current, previous = current.strip().lower(), previous.strip().lower()
+        if current != previous:
+            return False
+    return True
+
+
+def update_account_plan_check(acc_id: int | None = None, email: str | None = None, result: dict | None = None, *, expected_account: dict | None = None, expected_run_id: str | None = None) -> bool:
     """更新账号套餐/Plus 试用资格查询结果。"""
     result = result or {}
-    with _LOCK:
-        accounts = _load_accounts()
-        target_email = (email or "").lower()
-        row = next((
-            r for r in accounts
-            if (acc_id is not None and int(r.get("id") or 0) == int(acc_id))
-            or (target_email and (r.get("email") or "").lower() == target_email)
-        ), None)
+    with _LOCK, _account_for_update(acc_id, email) as row:
         if row is None:
+            return False
+        if expected_run_id is not None:
+            allowed_statuses = {"running"} if result.get("ok") else {"queued", "running"}
+            if row.get("plan_check_run_id") != expected_run_id or row.get("plan_check_status") not in allowed_statuses:
+                return False
+        if not _matches_check_snapshot(row, expected_account):
+            # 只结束自己占用的旧查询，不动后续任务，也不覆盖已有套餐权益。
+            if expected_run_id is not None:
+                row.update(plan_check_status="failed", plan_check_ok=False,
+                           plan_check_error="账号邮箱/AT 已变更，旧套餐结果已丢弃",
+                           plan_check_completed_at=_now(), updated_at=_now())
             return False
 
         ok = bool(result.get("ok"))
@@ -1427,11 +1560,11 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
         row["plan_check_network_route"] = result.get("network_route")
         row["plan_check_proxy_used"] = result.get("proxy_used")
         row["plan_check_proxy_fallback_reason"] = result.get("proxy_fallback_reason")
-        row["token_expired"] = result.get("token_expired")
-        row["token_expires_at"] = result.get("token_expires_at")
+        for key in ("token_expired", "token_expires_at"):
+            if key in result:
+                row[key] = result[key]
         row["plan_check_result_json"] = json.dumps(result, ensure_ascii=False)
         row["updated_at"] = _now()
-        _save_accounts(accounts)
         return True
 
 
@@ -1825,13 +1958,22 @@ def list_accounts_page(
 
 def get_account(acc_id: int) -> dict | None:
     with _LOCK:
-        row = next((r for r in _load_accounts() if int(r.get("id") or 0) == int(acc_id)), None)
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn:
+            row = _select_account(conn, acc_id)
         return _decorate_account(row) if row else None
 
 
 def get_account_by_email(email: str) -> dict | None:
     with _LOCK:
-        row = _find_by_email(_load_accounts(), email)
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn:
+            if not email:
+                # 保留历史空邮箱匹配行为；其他 API 的空邮箱参数不代表要选择账号。
+                record = conn.execute("SELECT payload FROM accounts WHERE email='' ORDER BY id LIMIT 1").fetchone()
+                row = json.loads(record["payload"]) if record else None
+            else:
+                row = _select_account(conn, email=email)
         return _decorate_account(row) if row else None
 
 
@@ -1915,6 +2057,7 @@ def finish_account_email_change(
             row["access_token"] = ""
             row["token_expired"] = True
             row["live_check_status"] = ""
+            row["live_check_run_id"] = None
             row["email_change_new_email"] = str(new_email).strip()
         row["email_change_status"] = "success" if ok else "failed"
         row["email_change_ok"] = bool(ok)
@@ -1945,13 +2088,19 @@ def recover_interrupted_email_changes() -> int:
         return count
 
 
-def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
+def update_account_liveness(acc_id: int, result: dict | None = None, *, expected_account: dict | None = None, expected_run_id: str | None = None) -> bool:
     """写回账号查活结果；成功时同步刷新最新 access_token 和账号基础信息。"""
     result = result or {}
-    with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+    with _LOCK, _account_for_update(acc_id) as row:
         if row is None:
+            return False
+        if expected_run_id is not None and (row.get("live_check_run_id") != expected_run_id
+                                            or row.get("live_check_status") not in {"queued", "running"}):
+            return False
+        if not _matches_check_snapshot(row, expected_account):
+            if expected_run_id is not None:
+                row.update(live_check_status="failed", live_check_ok=False, live_checked_at=_now(),
+                           live_check_error="账号邮箱/AT 已变更，旧查活结果已丢弃", updated_at=_now())
             return False
 
         now = _now()
@@ -1967,6 +2116,14 @@ def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
             token = str(result.get("access_token") or "").strip()
             if token:
                 row["access_token"] = token
+                # token 元数据属于当前 AT，不能等到套餐成功才清理旧 AT 的过期标记。
+                try:
+                    from core.chatgpt_plan import token_claims
+                    claims = token_claims(token)
+                except (TypeError, ValueError, AttributeError, OverflowError, OSError):
+                    claims = {}
+                row["token_expired"] = claims.get("token_expired")
+                row["token_expires_at"] = claims.get("token_expires_at")
             session = result.get("session") or {}
             user = session.get("user") or {}
             account = session.get("account") or {}
@@ -1985,7 +2142,6 @@ def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
             row["live_check_error"] = None
 
         row["copy_line"] = _account_line(row)
-        _save_accounts(rows)
         return True
 
 
@@ -2082,12 +2238,11 @@ def recover_interrupted_totp_setups() -> int:
         return recovered
 
 
-def claim_account_live_check(acc_id: int, trigger: str = "manual") -> bool:
+def claim_account_live_check(acc_id: int, trigger: str = "manual", *, run_id: str | None = None, expected_email: str | None = None) -> bool:
     """原子占用账号查活任务；已有 queued/running 时返回 False。"""
-    with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
-        if row is None:
+    with _LOCK, _account_for_update(acc_id) as row:
+        if row is None or (expected_email is not None
+                           and str(row.get("email") or "").strip().lower() != expected_email.strip().lower()):
             return False
         if row.get("live_check_status") in {"queued", "running"}:
             try:
@@ -2100,6 +2255,7 @@ def claim_account_live_check(acc_id: int, trigger: str = "manual") -> bool:
                 pass
         now = _now()
         row["live_check_status"] = "queued"
+        row["live_check_run_id"] = run_id
         row["live_check_ok"] = False
         row["live_check_trigger"] = str(trigger or "manual")
         row["live_check_queued_at"] = now
@@ -2107,7 +2263,6 @@ def claim_account_live_check(acc_id: int, trigger: str = "manual") -> bool:
         row["live_checked_at"] = None
         row["live_check_error"] = None
         row["updated_at"] = now
-        _save_accounts(rows)
         return True
 
 
@@ -2131,19 +2286,18 @@ def recover_interrupted_live_checks() -> int:
         return recovered
 
 
-def mark_account_live_check_running(acc_id: int) -> bool:
+def mark_account_live_check_running(acc_id: int, *, run_id: str | None = None) -> bool:
     """把账号查活任务标记为运行中。"""
-    with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+    with _LOCK, _account_for_update(acc_id) as row:
         if row is None or row.get("live_check_status") not in {"queued", "running"}:
+            return False
+        if run_id is not None and row.get("live_check_run_id") != run_id:
             return False
         now = _now()
         row["live_check_status"] = "running"
         row["live_check_started_at"] = now
         row["live_check_error"] = None
         row["updated_at"] = now
-        _save_accounts(rows)
         return True
 
 
@@ -2248,6 +2402,24 @@ def delete_account(acc_id: int | None = None, email: str | None = None) -> bool:
                 conn.executemany("DELETE FROM codex_agent_accounts WHERE account_id=?", [(x,) for x in deleted_ids])
                 conn.commit()
         return True
+
+
+def delete_deactivated_accounts(archived: str = "0") -> int:
+    """按归档范围直接删除已废账号及其 Agent 凭证；不重写其他账号或巡检历史。"""
+    if archived not in {"0", "only", "all"}:
+        raise ValueError("archived 必须为 0、only 或 all")
+    where = "lower(trim(COALESCE(json_extract(payload, '$.live_check_status'), ''))) = 'deactivated'"
+    params = ()
+    if archived != "all":
+        where += " AND archived=?"
+        params = (int(archived == "only"),)
+    with _LOCK:
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM codex_agent_accounts WHERE account_id IN "
+                         "(SELECT id FROM accounts WHERE " + where + ")", params)
+            return conn.execute("DELETE FROM accounts WHERE " + where, params).rowcount
 
 
 def delete_accounts(account_ids: list[int] | None = None, emails: list[str] | None = None) -> tuple[list[dict], list[dict]]:
@@ -2448,7 +2620,7 @@ def import_registered_email_accounts(records: list[dict], source: str | None) ->
                 pool_row["copy_line"] = _outlook_line(pool_row)
                 original_line = _outlook_line(pool_row)
 
-            row_id = _next_id(accounts)
+            row_id = _next_account_id()
             access_token = (raw.get("access_token") or raw.get("token") or "").strip()
             totp_secret = (raw.get("totp_secret") or raw.get("totp") or "").strip() or None
             account = {
@@ -3056,6 +3228,7 @@ def codex_accounts_summary() -> dict:
 def _new_job_row(
     rows: list[dict],
     *,
+    job_id: int | None = None,
     email_source: str,
     job_type: str = "registration",
     parent_job_id: int | None = None,
@@ -3069,7 +3242,7 @@ def _new_job_row(
     log_file = str(_LOG_DIR / f"{job_uuid}.log")
     Path(log_file).parent.mkdir(parents=True, exist_ok=True)
     return {
-        "id": _next_id(rows),
+        "id": int(job_id) if job_id is not None else _next_id(rows),
         "job_uuid": job_uuid,
         "job_type": job_type,
         "parent_job_id": parent_job_id,
@@ -3089,31 +3262,79 @@ def _new_job_row(
     }
 
 
-def create_job(email_source: str) -> dict:
-    """创建一个首次执行的 pending 注册任务。"""
+def _reserve_job_id_floor(conn, value: int) -> None:
+    conn.execute("INSERT INTO storage_meta(key,value) VALUES('registration_job_id_high_watermark',?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER),CAST(excluded.value AS INTEGER))",
+                 (str(value),))
+
+
+def _allocate_job_ids(conn, count: int) -> int:
+    """调用方持有写事务；删除最大/全部任务后也不能让旧 Future 命中新任务。"""
+    existing = int(conn.execute("SELECT COALESCE(MAX(id),0) FROM registration_jobs").fetchone()[0])
+    record = conn.execute("SELECT value FROM storage_meta WHERE key='registration_job_id_high_watermark'").fetchone()
+    floor = max(existing, int(record[0]) if record else 0)
+    _reserve_job_id_floor(conn, floor + count)
+    return floor + 1
+
+
+def _job_values(row: dict) -> tuple:
+    return (int(row['id']), str(row.get('email') or ''), str(row.get('status') or ''),
+            int(bool(row.get('archived'))), str(row.get('created_at') or ''),
+            str(row.get('updated_at') or ''), json.dumps(row, ensure_ascii=False))
+
+
+def _insert_job_rows(conn, rows: list[dict]) -> None:
+    conn.executemany(
+        "INSERT INTO registration_jobs(id,email,status,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?)",
+        [_job_values(row) for row in rows],
+    )
+
+
+def create_jobs(count: int, email_source: str) -> list[dict]:
+    """一次事务创建整批任务，不读取/重写历史任务 payload。"""
+    count = int(count)
+    if count <= 0:
+        return []
     with _LOCK:
-        rows = _load_jobs()
-        row = _new_job_row(rows, email_source=email_source)
-        rows.append(row)
-        _save_jobs(rows)
-        return dict(row)
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            first_id = _allocate_job_ids(conn, count)
+            rows = [_new_job_row([], job_id=first_id + index, email_source=email_source)
+                    for index in range(count)]
+            now = datetime.now().isoformat(timespec="microseconds")
+            for row in rows:
+                row['updated_at'] = now
+            _insert_job_rows(conn, rows)
+    return rows
+
+
+def create_job(email_source: str) -> dict:
+    return create_jobs(1, email_source)[0]
+
+
+def _finish_jobs_in_statuses(statuses: tuple[str, ...], status: str, error: str) -> int:
+    """按状态索引批量转换，SQLite 写事务保证不会取消已领取的任务。"""
+    with _LOCK:
+        _ensure_sqlite()
+        now = datetime.now().isoformat(timespec="microseconds")
+        with closing(_sqlite_conn()) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            marks = ','.join('?' for _ in statuses)
+            result = conn.execute(
+                "UPDATE registration_jobs SET status=?,updated_at=?,payload=json_set(payload,"
+                "'$.status',?,'$.error_message',?,'$.completed_at',?,'$.updated_at',?) "
+                f"WHERE status IN ({marks})", (status, now, status, error, now, now, *statuses))
+            return result.rowcount
 
 
 def recover_interrupted_registration_jobs() -> int:
-    """服务重启后将未完成的注册任务标记为 stopped，避免继续占用活动任务名额。"""
-    with _LOCK:
-        rows = _load_jobs()
-        changed = 0
-        now = _now()
-        for row in rows:
-            if row.get("status") in {"pending", "running", "stopping"}:
-                row["status"] = "stopped"
-                row["error"] = "服务重启，注册任务被中断并释放"
-                row["completed_at"] = now
-                changed += 1
-        if changed:
-            _save_jobs(rows)
-        return changed
+    return _finish_jobs_in_statuses(('pending', 'running', 'stopping'), 'stopped',
+                                   '服务重启，注册任务被中断并释放')
+
+
+def cancel_pending_registration_jobs() -> int:
+    return _finish_jobs_in_statuses(('pending',), 'cancelled', '用户手动取消')
 
 
 def create_retry_job(
@@ -3126,45 +3347,48 @@ def create_retry_job(
 ) -> tuple[dict, bool]:
     """原子创建重试子任务；同一任务链已有活跃任务时直接复用。"""
     with _LOCK:
-        rows = _load_jobs()
-        source = next((r for r in rows if int(r.get("id") or 0) == int(source_job_id)), None)
-        if source is None:
-            raise LookupError("任务不存在")
-        if source.get("status") not in ("failed", "stopped", "cancelled"):
-            raise ValueError(f"当前状态不支持重试：{source.get('status')}")
-
-        root_id = int(source.get("root_job_id") or source.get("id"))
-        active_states = {"pending", "running", "stopping"}
-        active = next((
-            r for r in rows
-            if int(r.get("id") or 0) != int(source_job_id)
-            and int(r.get("root_job_id") or 0) == root_id
-            and r.get("status") in active_states
-        ), None)
-        if active is not None:
-            if active.get("job_type", "registration") != job_type:
-                raise ValueError(f"已有其他类型重试任务 #{active.get('id')} 在排队或运行中")
-            return dict(active), False
-
-        attempts = [
-            int(r.get("retry_attempt") or 0)
-            for r in rows
-            if int(r.get("id") or 0) == root_id or int(r.get("root_job_id") or 0) == root_id
-        ]
-        row = _new_job_row(
-            rows,
-            email_source=email_source,
-            job_type=job_type,
-            parent_job_id=int(source_job_id),
-            root_job_id=root_id,
-            retry_attempt=(max(attempts) if attempts else 0) + 1,
-            retry_action=("codex" if job_type == "codex_retry" else "registration"),
-            email=email,
-            account_id=account_id,
-        )
-        rows.append(row)
-        _save_jobs(rows)
-        return dict(row), True
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            record = conn.execute("SELECT payload FROM registration_jobs WHERE id=?", (int(source_job_id),)).fetchone()
+            if record is None:
+                raise LookupError("任务不存在")
+            source = json.loads(record['payload'])
+            if source.get('status') not in ('failed', 'stopped', 'cancelled'):
+                raise ValueError(f"当前状态不支持重试：{source.get('status')}")
+            root_id = int(source.get('root_job_id') or source['id'])
+            active = conn.execute(
+                "SELECT payload FROM registration_jobs WHERE CAST(json_extract(payload, '$.root_job_id') AS INTEGER)=? "
+                "AND status IN ('pending','running','stopping') AND id!=? ORDER BY id LIMIT 1",
+                (root_id, int(source_job_id)),
+            ).fetchone()
+            if active is not None:
+                row = json.loads(active['payload'])
+                if row.get('job_type', 'registration') != job_type:
+                    raise ValueError(f"已有其他类型重试任务 #{row.get('id')} 在排队或运行中")
+                return row, False
+            successful = conn.execute(
+                "SELECT id FROM registration_jobs WHERE CAST(json_extract(payload, '$.root_job_id') AS INTEGER)=? "
+                "AND status='success' AND id!=? ORDER BY id DESC LIMIT 1", (root_id, int(source_job_id)),
+            ).fetchone()
+            if successful is not None:
+                raise ValueError(f"后续重试任务 #{successful['id']} 已成功")
+            attempt = conn.execute(
+                "SELECT COALESCE(MAX(CAST(json_extract(payload, '$.retry_attempt') AS INTEGER)),0) "
+                "FROM registration_jobs WHERE id=? OR CAST(json_extract(payload, '$.root_job_id') AS INTEGER)=?",
+                (root_id, root_id),
+            ).fetchone()[0]
+            next_id = _allocate_job_ids(conn, 1)
+            row = _new_job_row(
+                [], job_id=next_id, email_source=email_source, job_type=job_type,
+                parent_job_id=int(source_job_id), root_job_id=root_id,
+                retry_attempt=int(attempt) + 1,
+                retry_action='codex' if job_type == 'codex_retry' else 'registration',
+                email=email, account_id=account_id,
+            )
+            row['updated_at'] = datetime.now().isoformat(timespec="microseconds")
+            _insert_job_rows(conn, [row])
+            return row, True
 
 
 def update_job(
@@ -3177,27 +3401,43 @@ def update_job(
     completed_at: str | None = None,
     account_id: int | None = None,
     network_traffic: dict | None = None,
-) -> None:
+    expected_statuses: tuple[str, ...] | None = None,
+) -> bool:
+    """索引定位原子读改写；可选状态 CAS，重复元数据更新不产生写入。"""
     with _LOCK:
-        rows = _load_jobs()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(job_id)), None)
-        if row is None:
-            return
-        if status is not None:
-            row["status"] = status
-        if email is not None:
-            row["email"] = email
-        if error is not None:
-            row["error_message"] = error
-        if started_at is not None:
-            row["started_at"] = started_at
-        if completed_at is not None:
-            row["completed_at"] = completed_at
-        if account_id is not None:
-            row["account_id"] = account_id
-        if network_traffic is not None:
-            row["network_traffic"] = dict(network_traffic)
-        _save_jobs(rows)
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            record = conn.execute("SELECT payload FROM registration_jobs WHERE id=?", (int(job_id),)).fetchone()
+            if record is None:
+                return False
+            row = json.loads(record['payload'])
+            if expected_statuses is not None and row.get('status') not in expected_statuses:
+                return False
+            before = dict(row)
+            if status is not None:
+                row["status"] = status
+            if email is not None:
+                row["email"] = email
+            if error is not None:
+                row["error_message"] = error
+            if started_at is not None:
+                row["started_at"] = started_at
+            if completed_at is not None:
+                row["completed_at"] = completed_at
+            if account_id is not None:
+                row["account_id"] = account_id
+            if network_traffic is not None:
+                row["network_traffic"] = dict(network_traffic)
+            if row == before:
+                return True
+            row['updated_at'] = datetime.now().isoformat(timespec="microseconds")
+            values = _job_values(row)
+            conn.execute(
+                "UPDATE registration_jobs SET email=?,status=?,archived=?,created_at=?,updated_at=?,payload=? WHERE id=?",
+                (*values[1:], values[0]),
+            )
+            return True
 
 
 def list_jobs(limit: int = 100) -> list[dict]:
@@ -3206,20 +3446,22 @@ def list_jobs(limit: int = 100) -> list[dict]:
 
 
 def list_jobs_page(limit: int = 50, offset: int = 0) -> dict:
-    """直接使用 registration_jobs 的 SQL LIMIT/OFFSET 返回任务页。"""
-    with _LOCK:
-        limit = max(1, int(limit))
-        offset = max(0, int(offset or 0))
-        rows, total, latest = _query_collection_page(
-            "jobs", limit=limit, offset=offset
-        )
-        return {
-            "items": rows,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "revision": f"{total}:{latest}",
-        }
+    """索引分页；同一读事务内获取当前页、状态计数和 revision。"""
+    _ensure_sqlite()
+    limit, offset = max(1, int(limit)), max(0, int(offset or 0))
+    with closing(_sqlite_conn()) as conn, conn:
+        conn.execute("BEGIN")
+        counts = {}
+        for row in conn.execute("SELECT status, COUNT(*) AS n FROM registration_jobs GROUP BY status"):
+            status = str(row['status'] or 'unknown')
+            counts[status] = counts.get(status, 0) + int(row['n'])
+        total = sum(counts.values())
+        counts['active'] = sum(counts.get(status, 0) for status in ('pending', 'running', 'stopping'))
+        latest = conn.execute("SELECT COALESCE(MAX(updated_at), '') FROM registration_jobs").fetchone()[0]
+        rows = [json.loads(row['payload']) for row in conn.execute(
+            "SELECT payload FROM registration_jobs ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset))]
+    return {'items': rows, 'total': total, 'offset': offset, 'limit': limit,
+            'revision': f'{total}:{latest}', 'status_counts': counts}
 
 
 def job_status_counts() -> dict:
@@ -3236,29 +3478,87 @@ def job_status_counts() -> dict:
     return counts
 
 
+def get_jobs_by_ids(job_ids: list[int]) -> list[dict]:
+    """读取指定批次的最新任务快照，保持输入顺序。"""
+    ids = list(dict.fromkeys(int(value) for value in job_ids))
+    if not ids:
+        return []
+    _ensure_sqlite()
+    found = {}
+    with closing(_sqlite_conn()) as conn:
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            marks = ','.join('?' for _ in chunk)
+            for record in conn.execute(f"SELECT id,payload FROM registration_jobs WHERE id IN ({marks})", chunk):
+                found[int(record['id'])] = json.loads(record['payload'])
+    return [found[value] for value in ids if value in found]
+
+
 def get_job(job_id: int) -> dict | None:
-    with _LOCK:
-        row = next((r for r in _load_jobs() if int(r.get("id") or 0) == int(job_id)), None)
-        return dict(row) if row else None
+    rows = get_jobs_by_ids([job_id])
+    return rows[0] if rows else None
+
+
+def get_job_retry_context(jobs: list[dict]) -> dict[int, dict]:
+    """批量获取当前页终态任务的后续成功重试和账号摘要，消除 N+1 全表读取。"""
+    jobs = [job for job in jobs if job.get('status') in ('failed', 'stopped', 'cancelled')]
+    if not jobs:
+        return {}
+    roots = list({int(job.get('root_job_id') or job['id']) for job in jobs})
+    account_ids = set()
+    for job in jobs:
+        try:
+            if job.get('account_id') is not None:
+                account_ids.add(int(job['account_id']))
+        except (TypeError, ValueError):
+            pass
+    emails = list({str(job.get('email') or '').strip().lower() for job in jobs} - {''})
+    successes, accounts, by_email = {}, {}, {}
+    _ensure_sqlite()
+    with closing(_sqlite_conn()) as conn, conn:
+        conn.execute('BEGIN')
+        for start in range(0, len(roots), 400):
+            chunk = roots[start:start + 400]
+            marks = ','.join('?' for _ in chunk)
+            for row in conn.execute(
+                f"SELECT id,CAST(json_extract(payload, '$.root_job_id') AS INTEGER) AS root_id FROM registration_jobs "
+                f"WHERE CAST(json_extract(payload, '$.root_job_id') AS INTEGER) IN ({marks}) AND status='success' ORDER BY id DESC", chunk):
+                successes.setdefault(int(row['root_id']), []).append({'id': int(row['id'])})
+        for column, values in [('id', list(account_ids)), ('account_email_lower(email)', emails)]:
+            for start in range(0, len(values), 400):
+                chunk = values[start:start + 400]
+                marks = ','.join('?' for _ in chunk)
+                for row in conn.execute(
+                    f"SELECT id,email,json_extract(payload, '$.codex_status') AS codex_status FROM accounts WHERE {column} IN ({marks}) ORDER BY id", chunk):
+                    account = dict(row)
+                    accounts[int(row['id'])] = account
+                    email_key = str(row['email'] or '').lower()
+                    previous = by_email.get(email_key)
+                    if previous is None or int(row['id']) < int(previous['id']):
+                        by_email[email_key] = account
+    result = {}
+    for job in jobs:
+        root = int(job.get('root_job_id') or job['id'])
+        success = next((row for row in successes.get(root, []) if row['id'] != int(job['id'])), None)
+        try:
+            account = accounts.get(int(job['account_id'])) if job.get('account_id') is not None else None
+        except (TypeError, ValueError):
+            account = None
+        account = account or by_email.get(str(job.get('email') or '').strip().lower())
+        result[int(job['id'])] = {'successful_retry': success, 'account': account}
+    return result
 
 
 def get_successful_retry_for_job(job_id: int) -> dict | None:
     """返回同一任务链中已成功的其他重试任务，用于保留原任务历史状态并阻止重复重试。"""
-    with _LOCK:
-        rows = _load_jobs()
-        source = next((r for r in rows if int(r.get("id") or 0) == int(job_id)), None)
-        if source is None:
-            return None
-        root_id = int(source.get("root_job_id") or source.get("id") or 0)
-        matches = [
-            r for r in rows
-            if int(r.get("id") or 0) != int(job_id)
-            and int(r.get("root_job_id") or 0) == root_id
-            and r.get("status") == "success"
-        ]
-        if not matches:
-            return None
-        return dict(max(matches, key=lambda r: int(r.get("id") or 0)))
+    job = get_job(job_id)
+    if job is None:
+        return None
+    # 调用方只对失败终态任务检查成功重试；兼容其他状态的直接调用。
+    context_job = dict(job, status='failed')
+    context = get_job_retry_context([context_job]).get(int(job_id), {})
+    match = context.get('successful_retry')
+    return get_job(match['id']) if match else None
 
 
 def delete_job(job_id: int, *, delete_log: bool = True, allow_running: bool = False) -> bool:
@@ -3267,14 +3567,17 @@ def delete_job(job_id: int, *, delete_log: bool = True, allow_running: bool = Fa
     默认不删除 running 任务，避免后台线程仍在执行但前端记录消失。
     """
     with _LOCK:
-        rows = _load_jobs()
-        idx = next((i for i, r in enumerate(rows) if int(r.get("id") or 0) == int(job_id)), None)
-        if idx is None:
-            return False
-        if not allow_running and rows[idx].get("status") in ("running", "stopping"):
-            return False
-        row = rows.pop(idx)
-        _save_jobs(rows)
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            record = conn.execute('SELECT payload FROM registration_jobs WHERE id=?', (int(job_id),)).fetchone()
+            if record is None:
+                return False
+            row = json.loads(record['payload'])
+            if not allow_running and row.get('status') in ('running', 'stopping'):
+                return False
+            _reserve_job_id_floor(conn, int(job_id))
+            conn.execute('DELETE FROM registration_jobs WHERE id=?', (int(job_id),))
 
     if delete_log:
         log_file = row.get("log_file")
@@ -3528,3 +3831,125 @@ def domain_email_pool_summary() -> dict:
 def delete_domain_email(email: str) -> bool:
     """从域名邮箱池删除一个邮箱。"""
     return delete_email_pool(email, source="cloudflare_domain")
+
+
+# 巡检任务与账号业务状态分开持久化，唯一索引保证跨线程/进程启动防重。
+def _migrate_inspection_snapshots(conn):
+    """升级旧任务：ID 快照只保存一次，统计 payload 不再携带整份清单。"""
+    if conn.execute("SELECT 1 FROM storage_meta WHERE key='inspection_snapshots_v1'").fetchone():
+        return
+    for record in conn.execute("SELECT id,payload FROM account_inspections"):
+        run = json.loads(record["payload"])
+        if "account_ids" not in run:
+            continue
+        ids = run.pop("account_ids")
+        conn.execute("INSERT OR IGNORE INTO account_inspection_snapshots VALUES (?,?)",
+                     (record["id"], json.dumps(ids)))
+        conn.execute("UPDATE account_inspections SET payload=? WHERE id=?",
+                     (json.dumps(run, ensure_ascii=False), record["id"]))
+    conn.execute("INSERT INTO storage_meta(key,value) VALUES ('inspection_snapshots_v1',?)", (_now(),))
+
+
+def _inspection_conn():
+    _ensure_sqlite()
+    return _sqlite_conn()
+
+
+def _inspection_payload(run):
+    return json.dumps({k: v for k, v in run.items() if k != "account_ids"}, ensure_ascii=False)
+
+
+def create_account_inspection(account_ids: list[int] | None = None, workers: int = 3, archived: str = "0") -> tuple[dict, bool]:
+    if account_ids is not None:
+        account_ids = list(dict.fromkeys(int(account_id) for account_id in account_ids))
+    with closing(_inspection_conn()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        active = conn.execute("SELECT payload FROM account_inspections WHERE status IN ('queued','running')").fetchone()
+        if active:
+            existing = json.loads(active[0])
+            snapshot = conn.execute("SELECT account_ids FROM account_inspection_snapshots WHERE inspection_id=?",
+                                    (existing["id"],)).fetchone()
+            existing["account_ids"] = json.loads(snapshot[0]) if snapshot else []
+            return existing, False
+        if account_ids is None:
+            # 与任务占用处于同一事务中，避免 OFFSET 分页遇到新增/归档/删除时漏账号。
+            sql = "SELECT id FROM accounts"
+            params = ()
+            if archived != "all":
+                sql += " WHERE archived=?"
+                params = (int(archived == "only"),)
+            account_ids = [row[0] for row in conn.execute(sql + " ORDER BY id DESC", params)]
+        run = dict(status="queued", workers=workers, archived=archived, created_at=_now(), finished_at=None,
+                   total_count=len(account_ids), checked_count=0, skipped_count=0, deactivated_skipped_count=0, invalid_count=0,
+                   live_success_count=0, live_failed_count=0,
+                   plan_success_count=0, plan_failed_count=0, error="",
+                   failure_details_available=True, account_ids=account_ids)
+        cursor = conn.execute("INSERT INTO account_inspections(status,payload) VALUES (?,?)", (run["status"], _inspection_payload(run)))
+        run["id"] = cursor.lastrowid
+        conn.execute("UPDATE account_inspections SET payload=? WHERE id=?", (_inspection_payload(run), run["id"]))
+        conn.execute("INSERT INTO account_inspection_snapshots(inspection_id,account_ids) VALUES (?,?)",
+                     (run["id"], json.dumps(account_ids)))
+        return run, True
+
+
+def save_account_inspection(run: dict, *, failure: dict | None = None) -> bool:
+    # 终态不可覆盖，防止旧线程把已中断任务重新写为 running 或冲突新任务唯一索引。
+    with closing(_inspection_conn()) as conn, conn:
+        cursor = conn.execute("""UPDATE account_inspections SET status=?,payload=?
+                                 WHERE id=? AND status IN ('queued', 'running')""",
+                              (run["status"], _inspection_payload(run), run["id"]))
+        saved = cursor.rowcount == 1
+        if saved and failure is not None:
+            # 统计和明细同事务保存；终态/旧 worker 不能补写历史或留下孤立明细。
+            conn.execute("""INSERT INTO account_inspection_failures
+                (inspection_id,account_id,email,status,error,failed_at) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(inspection_id,account_id) DO NOTHING""",
+                (run["id"], int(failure["account_id"]), str(failure.get("email") or "")[:320],
+                 str(failure.get("status") or "failed")[:40],
+                 str(failure.get("error") or "查活失败，未返回具体原因")[:2000],
+                 str(failure.get("failed_at") or _now())))
+        return saved
+
+
+def list_account_inspection_failures(inspection_id: int, limit: int = 20, offset: int = 0) -> dict | None:
+    with closing(_inspection_conn()) as conn:
+        conn.execute("BEGIN")
+        task = conn.execute("SELECT payload FROM account_inspections WHERE id=?", (inspection_id,)).fetchone()
+        if task is None:
+            return None
+        run = json.loads(task[0])
+        items = conn.execute("""SELECT account_id,email,status,error,failed_at
+            FROM account_inspection_failures WHERE inspection_id=? ORDER BY account_id LIMIT ? OFFSET ?""",
+            (inspection_id, limit, offset)).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM account_inspection_failures WHERE inspection_id=?",
+                             (inspection_id,)).fetchone()[0]
+    return dict(task={k: v for k, v in run.items() if k != "account_ids"},
+                items=[dict(row) for row in items], total=total,
+                details_available=bool(run.get("failure_details_available")), limit=limit, offset=offset)
+
+
+def list_account_inspections(limit: int = 50, offset: int = 0) -> dict:
+    with closing(_inspection_conn()) as conn:
+        conn.execute("BEGIN")  # items、active、total 使用同一读快照。
+        rows = conn.execute("SELECT payload FROM account_inspections ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+        active = conn.execute("SELECT payload FROM account_inspections WHERE status IN ('queued','running')").fetchone()
+        total = conn.execute("SELECT COUNT(*) FROM account_inspections").fetchone()[0]
+    def public(payload):
+        return {k: v for k, v in json.loads(payload).items() if k != "account_ids"}
+    return dict(items=[public(r[0]) for r in rows], total=total,
+                active=public(active[0]) if active else None)
+
+
+def recover_interrupted_account_inspections(error: str = "WebUI 重启，巡检已中断；统计保留已完成部分") -> int:
+    with closing(_inspection_conn()) as conn, conn:
+        # 没有待恢复任务时是纯读操作，不能为每次空闲轮询竞争 SQLite 写锁。
+        if not conn.execute("SELECT 1 FROM account_inspections WHERE status IN ('queued','running') LIMIT 1").fetchone():
+            return 0
+        conn.execute("BEGIN IMMEDIATE")
+        # 加锁后重新读取，避免使用竞争写锁之前的旧快照。
+        rows = conn.execute("SELECT payload FROM account_inspections WHERE status IN ('queued','running')").fetchall()
+        for row in rows:
+            run = json.loads(row[0])
+            run.update(status="interrupted", finished_at=_now(), error=error)
+            conn.execute("UPDATE account_inspections SET status=?,payload=? WHERE id=?", (run["status"], _inspection_payload(run), run["id"]))
+        return len(rows)
