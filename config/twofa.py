@@ -13,8 +13,12 @@ from config.env_loader import apply_env_overrides
 ENABLE_2FA = False
 
 # 2FA 网络代理模式：
-#   saved = 优先使用账号保存的有效代理（无有效代理时回退代理池）
-#   pool  = 忽略账号保存的代理，每次任务都从 PROXY_POOL 随机抽取
+#   saved      = 优先使用账号保存的有效代理（无有效代理时回退代理池）
+#   pool       = 忽略账号保存的代理，每次任务都从 PROXY_POOL 随机抽取
+#   plan_check = 走套餐/查活专用代理池 PLAN_CHECK_PROXY（含 PLAN_CHECK_UPSTREAM_PROXY
+#                上游链路）。auth.openai.com 全站质询期间，clash 等被标记出口连
+#                真实浏览器都会被质询，仅该池的住宅出口配合 tools/cf_cookie_warm.py
+#                预热的 __cf_bm 可通过；该模式会消耗住宅流量，按需开启。
 TWOFA_PROXY_MODE = "saved"
 
 # 发起 reauth（CSRF + signin）时的临时网络错误重试。403 会先清理当前会话的

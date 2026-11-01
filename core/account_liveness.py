@@ -109,6 +109,9 @@ def _new_fingerprint_pinned_session(
         generated_profile = getattr(session, "browser_profile", None)
         if isinstance(generated_profile, dict):
             state["browser_profile"] = dict(generated_profile)
+    # auth.openai.com质询期间：真实 Chrome 预热的 __cf_bm/cf_clearance。
+    from core.cf_warm import apply_warmed_cf_cookies
+    apply_warmed_cf_cookies(session, state.get("cf_cookies"))
     return session
 
 

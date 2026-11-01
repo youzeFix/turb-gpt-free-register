@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -82,23 +83,58 @@ def _normalize_proxy(proxy: str | None) -> str | None:
 
 
 def _resolve_twofa_proxy(proxy: str | None):
-    """按 TWOFA_PROXY_MODE 解析传输代理。"""
+    """按 TWOFA_PROXY_MODE 解析传输代理。
+
+    返回 (传输代理, 本地链式中继或 None, 模式标签, 预热目标代理)。
+    预热目标代理是真实出口地址（CF 预热 Cookie 按出口绑定），plan_check
+    模式下链式中继的本地回环地址不能用于匹配预热缓存。
+    """
     mode = str(getattr(_twofa_cfg, "TWOFA_PROXY_MODE", "saved") or "saved").strip().lower()
-    if mode not in {"saved", "pool"}:
-        raise ValueError(f"TWOFA_PROXY_MODE={mode!r} 无效，可选 saved / pool")
+    if mode not in {"saved", "pool", "plan_check"}:
+        raise ValueError(f"TWOFA_PROXY_MODE={mode!r} 无效，可选 saved / pool / plan_check")
     if mode == "pool":
         from core.proxy_chain import open_proxy_pool_proxy
         transport, relay = open_proxy_pool_proxy(None)
-        return transport or None, relay, "pool"
+        return transport or None, relay, "pool", None
+    if mode == "plan_check":
+        from config import proxy as proxy_cfg
+        from core.chatgpt_plan import (
+            _proxy_lines,
+            open_plan_check_proxy,
+            resolve_plan_check_route,
+        )
+        values = [
+            str(item).strip()
+            for item in _proxy_lines(getattr(proxy_cfg, "PLAN_CHECK_PROXY", ""))
+            if str(item).strip()
+        ]
+        if not values:
+            # 未配置套餐/查活住宅池时回退代理池，2FA 不能因此完全不可用。
+            from core.proxy_chain import open_proxy_pool_proxy
+            transport, relay = open_proxy_pool_proxy(None)
+            return transport or None, relay, "pool_fallback", None
+        target = random.choice(values)
+        timeout = getattr(proxy_cfg, "PLAN_CHECK_TIMEOUT", 15.0)
+        route = resolve_plan_check_route(explicit_proxy=target)
+        # 显式覆盖时 resolve_plan_check_route 不带上游；与查活 _live_proxy_route
+        # 保持一致，住宅出口必须经 PLAN_CHECK_UPSTREAM_PROXY 上游链路（部分
+        # 住宅服务商拒绝中国大陆出口直连）。
+        upstream = str(getattr(proxy_cfg, "PLAN_CHECK_UPSTREAM_PROXY", "") or "").strip()
+        if upstream:
+            route["upstream_proxy"] = upstream
+        transport, relay = open_plan_check_proxy(route, target, timeout=timeout)
+        return transport, relay, "plan_check", target
     target = _normalize_proxy(proxy)
     if not target:
         # 没有可复用的目标代理时交给 BrowserSession 从代理池选择；
         # BrowserSession 会自行管理代理池链式中继生命周期。
-        return None, None, "pool"
+        from core.proxy_chain import open_proxy_pool_proxy
+        transport, relay = open_proxy_pool_proxy(None)
+        return transport or None, relay, "pool", None
     from core.proxy_chain import open_proxy_pool_proxy
 
     transport, relay = open_proxy_pool_proxy(target)
-    return transport, relay, "saved"
+    return transport, relay, "saved", target
 
 
 def is_running(acc_id: int) -> bool:
@@ -141,9 +177,21 @@ def _run_twofa(
         fh.addFilter(lambda record: record.threadName == thread_name)
         root_logger.addHandler(fh)
         logger.info("[2FA] 开始后台设置：email=%s trigger=%s", email, trigger)
-        real_proxy, relay, proxy_source = _resolve_twofa_proxy(proxy)
+        real_proxy, relay, proxy_source, warm_target = _resolve_twofa_proxy(proxy)
         identity = email.strip().lower()
         session = BrowserSession(proxy=real_proxy, fingerprint_seed=f"account:{identity}")
+        # auth.openai.com 全站质询期间，协议会话必须携带真实 Chrome 预热的
+        # __cf_bm（与出口 IP 绑定）；预热目标用真实出口地址：
+        #   saved/pool 模式 = 会话目标代理本身；
+        #   plan_check 模式链式中继只给本地回环 URL，按选中的住宅出口匹配缓存。
+        from core.cf_warm import load_warmed_exit, apply_warmed_cf_cookies
+        warmed = load_warmed_exit(warm_target or getattr(session, "proxy_target", None) or session.proxy)
+        if warmed is not None:
+            applied = apply_warmed_cf_cookies(session, warmed)
+            if applied:
+                _append_log(email, f"[2FA] 已注入预热 CF Cookie：{warmed.get('exit_key')}（age={int(warmed.get('age_seconds') or 0)}s）")
+        else:
+            _append_log(email, "[2FA] 该出口缺少新鲜 CF 预热缓存（>25分钟或未预热）；如 authorize 403 可执行 tools/cf_cookie_warm.py 预热")
         target_label = mask_proxy_url(getattr(session, "proxy_target", None) or session.proxy or "direct") or "direct"
         transport_label = mask_proxy_url(session.proxy or "direct") or "direct"
         _append_log(

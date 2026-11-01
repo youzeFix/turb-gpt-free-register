@@ -309,10 +309,11 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "TWOFA_PROXY_MODE", "file": "twofa.py", "type": "str", "group": "功能开关",
-        "label": "2FA代理模式", "help": "saved=优先使用账号保存的代理；pool=忽略保存代理，每次从代理池随机取一个；修改后需重启服务",
+        "label": "2FA代理模式", "help": "saved=账号保存的代理；pool=每次从代理池随机取一个；plan_check=走套餐/查活住宅代理池（消耗住宅流量）。修改后需重启服务",
         "choices": [
             {"value": "saved", "label": "使用账号保存的代理"},
             {"value": "pool", "label": "每次从代理池随机获取"},
+            {"value": "plan_check", "label": "套餐/查活住宅代理池"},
         ],
     },
     {

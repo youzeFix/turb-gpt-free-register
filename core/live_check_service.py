@@ -171,12 +171,22 @@ def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: 
             )
             # 占用属于本次出口尝试，不得沿用上一次失败回调的完成标志。
             completed_in_session = False
+            # auth.openai.com 全站质询期间，协议会话必须携带真实 Chrome 预热的
+            # __cf_bm；工具 tools/cf_cookie_warm.py 按出口生成缓存。
+            from core.cf_warm import load_warmed_exit
+            warmed = load_warmed_exit(selected_proxy)
+            if warmed is None:
+                _safe_append_log(
+                    email,
+                    "[查活] 该出口缺少新鲜 CF 预热缓存（含 __cf_bm，>25分钟自动过期）；"
+                    "如 authorize 403 可执行 .venv/Scripts/python.exe tools/cf_cookie_warm.py 预热",
+                )
             result = check_account_liveness(
                 email,
                 proxy=effective_proxy,
                 clear_log=False,
                 email_source=email_source,
-                fingerprint_state={"force_fresh": route_attempt > 1},
+                fingerprint_state={"force_fresh": route_attempt > 1, "cf_cookies": warmed},
                 on_authenticated=authenticated,
             )
             if relay is not None:
