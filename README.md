@@ -453,7 +453,7 @@ API Key 需要商品、余额、邮箱读取及 `orders:write` 等对应权限�
 
 #### Remail 开放 API
 
-Remail API 文档：[https://remail.aishop6.com/docs](https://remail.aishop6.com/docs)。该服务使用 API Key
+Remail API 文档：[https://remail.best/docs](https://remail.best/docs)。该服务使用 API Key
 按项目创建短效接码订单，订单返回的邮箱和 service token 会自动用于后续取码。
 
 在 WebUI「配置 → 邮箱 / OTP」填写：
@@ -467,7 +467,7 @@ Remail API 文档：[https://remail.aishop6.com/docs](https://remail.aishop6.com
 ```dotenv
 USE_EMAIL_SERVICE=True
 EMAIL_SOURCE=remail
-REMAIL_API_BASE=https://remail.aishop6.com
+REMAIL_API_BASE=https://remail.best
 REMAIL_API_KEY=你的_Remail_API_Key
 REMAIL_PROJECT_ID=项目ID
 REMAIL_EMAIL_SUFFIX=outlook.com

@@ -29,7 +29,7 @@ class RemailWebUiTests(unittest.TestCase):
     def test_jobs_with_remail_config_does_not_check_local_pool(self, submit_registration, outlook_pool_summary):
         with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
             email_config, "EMAIL_SOURCE", "remail"
-        ), patch.object(email_config, "REMAIL_API_BASE", "https://remail.aishop6.com", create=True), patch.object(
+        ), patch.object(email_config, "REMAIL_API_BASE", "https://remail.best", create=True), patch.object(
             email_config, "REMAIL_API_KEY", "rk-test-key", create=True
         ), patch.object(email_config, "REMAIL_PROJECT_ID", 1001, create=True), patch.object(
             email_config, "REMAIL_EMAIL_SUFFIX", "outlook.com", create=True

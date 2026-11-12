@@ -11,7 +11,7 @@ class RemailConfigTests(unittest.TestCase):
     def test_email_config_declares_remail_defaults(self):
         source = Path(email.__file__).read_text(encoding="utf-8")
         self.assertIn('REMAIL_API_KEY = env_str("REMAIL_API_KEY", "")', source)
-        self.assertIn('REMAIL_API_BASE = "https://remail.aishop6.com"', source)
+        self.assertIn('REMAIL_API_BASE = "https://remail.best"', source)
         self.assertIn("REMAIL_PROJECT_ID = 2", source)
         self.assertIn('REMAIL_SERVICE_MODE = "purchase"', source)
         self.assertIn('REMAIL_SUPPLY_POLICY = "public_only"', source)
@@ -25,7 +25,7 @@ class RemailConfigTests(unittest.TestCase):
         self.assertEqual(fields["REMAIL_API_BASE"]["group"], "邮箱 / OTP")
         self.assertEqual(
             fields["REMAIL_API_BASE"]["external_url"],
-            "https://remail.aishop6.com/register?aff=AFFLGYQMTYIXH",
+            "https://remail.best/register?aff=AFFLGYQMTYIXH",
         )
         self.assertTrue(fields["REMAIL_API_KEY"]["secret"])
         self.assertEqual(fields["REMAIL_API_KEY"]["storage"], "env")

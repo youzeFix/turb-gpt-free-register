@@ -36,6 +36,15 @@ def _configured_live_check_proxies(proxy_cfg) -> list[str]:
     return [str(value).strip() for value in values if str(value).strip()]
 
 
+def _browser_live_check_proxy(proxy_cfg) -> str | None:
+    """浏览器查活的出口：真实浏览器可自行通过 CF 质询，走注册代理池即可。
+
+    不使用 PLAN_CHECK_PROXY 住宅池（协议模式专用），避免不必要的住宅流量。
+    """
+    values = [str(v).strip() for v in (getattr(proxy_cfg, "PROXY_POOL", []) or []) if str(v).strip()]
+    return random.choice(values) if values else None
+
+
 def _live_proxy_route(proxy_url: str, proxy_cfg) -> dict:
     route = resolve_plan_check_route(explicit_proxy=proxy_url)
     upstream = str(getattr(proxy_cfg, "PLAN_CHECK_UPSTREAM_PROXY", "") or "").strip()
@@ -95,10 +104,26 @@ def complete_authenticated_live_check(*, account_id: int, expected_account: dict
         return {"ok": False, "status": "failed", "error": "账号已删除或邮箱/AT 已变更，丢弃旧查活结果"}
     try:
         from core.plan_check_service import check_account_plan_in_session
-        result["plan_result"] = check_account_plan_in_session(
-            account_id=account_id, email=expected_account["email"],
-            access_token=result["access_token"], session=session,
-        )
+        if result.get("driver") == "cloak":
+            # 浏览器查活的 on_authenticated 会话是 CloakSeleniumDriver，不能
+            # 当协议 BrowserSession 用；套餐查询单独开协议会话（chatgpt.com
+            # 侧无 CF 全站质询，出口走注册代理池即可，不消耗住宅流量）。
+            from config import proxy as proxy_cfg
+            from core.session import BrowserSession, close_browser_session
+            clash_proxy = _browser_live_check_proxy(proxy_cfg)
+            plan_session = BrowserSession(proxy=clash_proxy or None, detect_exit_geo=False)
+            try:
+                result["plan_result"] = check_account_plan_in_session(
+                    account_id=account_id, email=expected_account["email"],
+                    access_token=result["access_token"], session=plan_session,
+                )
+            finally:
+                close_browser_session(plan_session)
+        else:
+            result["plan_result"] = check_account_plan_in_session(
+                account_id=account_id, email=expected_account["email"],
+                access_token=result["access_token"], session=session,
+            )
     except Exception as exc:
         logger.exception("[查活] 自动查套餐异常: account_id=%s", account_id)
         result["plan_result"] = {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
@@ -125,6 +150,8 @@ def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: 
             _safe_append_log(email, "[查活] 账号已删除或查活状态已被重置，取消执行")
             return {"ok": False, "status": "failed", "error": "账号已删除或查活状态已被重置"}
         from config import proxy as proxy_cfg
+        from config import roxybrowser as _roxy_cfg
+        driver_mode = str(getattr(_roxy_cfg, "LIVE_CHECK_DRIVER", "protocol") or "protocol").strip().lower()
         candidates = _configured_live_check_proxies(proxy_cfg)
         route = resolve_plan_check_route(explicit_proxy=proxy)
         # 查活规则独立于套餐查询的 direct/auto 选择：只要任一代理池有数据，
@@ -145,6 +172,59 @@ def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: 
         email_source = str(account.get("email_source") or "").strip() or None
         if email_source:
             _safe_append_log(email, f"[查活] 使用注册时保存的邮箱来源：{email_source}")
+
+        if driver_mode in ("cloak", "cloakbrowser", "browser"):
+            # 浏览器查活：真实指纹浏览器可自行通过 CF 质询，出口走注册代理池
+            # （本地 clash），不使用 PLAN_CHECK_PROXY 住宅池，也不需要 CF 预热。
+            # 浏览器模块日志与协议查活共用 live-check-<email>.log。
+            fh_live: logging.FileHandler | None = None
+            root_logger = logging.getLogger()
+            thread_name = threading.current_thread().name
+            try:
+                log_file = log_path(email)
+                log_file.parent.mkdir(parents=True, exist_ok=True)
+                fh_live = logging.FileHandler(str(log_file), encoding="utf-8")
+                fh_live.setLevel(logging.DEBUG)
+                fh_live.setFormatter(logging.Formatter(
+                    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+                fh_live.addFilter(lambda record: record.threadName == thread_name)
+                root_logger.addHandler(fh_live)
+            except Exception:
+                fh_live = None
+                logger.warning("[查活] 浏览器查活日志挂载失败: %s", email, exc_info=True)
+            browser_proxy = _browser_live_check_proxy(proxy_cfg)
+            _safe_append_log(
+                email,
+                f"[查活] 开始后台执行 trigger={trigger} driver=cloak "
+                f"proxy_used={_mask_proxy(browser_proxy or '') or 'direct'}",
+            )
+            from core.cloakbrowser_liveness import run_cloak_liveness
+            completed_in_session = False
+            result = run_cloak_liveness(email, proxy=browser_proxy, on_authenticated=authenticated)
+            if fh_live is not None:
+                try:
+                    root_logger.removeHandler(fh_live)
+                    fh_live.close()
+                except Exception:
+                    logger.warning("[查活] 浏览器查活日志关闭失败", exc_info=True)
+            if not completed_in_session and not db.update_account_liveness(
+                account_id, result, expected_account=expected_account, expected_run_id=run_id
+            ):
+                return {"ok": False, "status": "failed", "error": "账号已删除或邮箱/AT 已变更，丢弃旧查活结果"}
+            if result.get("ok"):
+                _safe_append_log(email, "[查活] 完成：账号正常，已刷新最新 AT/accessToken（浏览器驱动）")
+            elif result.get("status") == "deactivated":
+                _safe_append_log(email, f"[查活] 完成：账号已废 {result.get('error') or ''}")
+            else:
+                _safe_append_log(email, f"[查活] 完成：失败 {result.get('error') or ''}")
+            result.update({
+                "network_route": "browser_proxy",
+                "proxy_mode": "proxy_pool",
+                "proxy_used": _mask_proxy(browser_proxy or "") or None,
+                "driver": "cloak",
+            })
+            return result
+
         _safe_append_log(
             email,
             "[查活] 开始后台执行 "

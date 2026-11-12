@@ -29,7 +29,7 @@ from core.otp_utils import extract_otp
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_API_BASE = "https://remail.aishop6.com"
+DEFAULT_API_BASE = "https://remail.best"
 REQUEST_TIMEOUT = 20
 _CODE_RE = re.compile(r"\b(\d{6})\b")
 _FINAL_ORDER_STATUSES = {"failed", "refunded", "closed"}
@@ -74,7 +74,7 @@ def _base_url(value: str | None = None) -> str:
 
     parsed = urlsplit(raw.rstrip("/"))
     if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
-        raise RemailError("Remail API 地址无效，请填写 https://remail.aishop6.com（不要填写接口路径）")
+        raise RemailError("Remail API 地址无效，请填写 https://remail.best（不要填写接口路径）")
 
     path = parsed.path.rstrip("/")
     # 文档链接可直接粘贴到配置页；API 实际位于同一域名根路径。
@@ -737,3 +737,58 @@ def list_projects(*, search: str | None = None, product_type: str | None = "micr
         if isinstance(items, list):
             return [item for item in items if isinstance(item, dict)]
     return []
+
+
+def get_order_detail(order_no: str) -> dict:
+    """查询订单详情（通道体检等工具使用）；失败抛 RemailError。"""
+    target = str(order_no or "").strip()
+    if not target:
+        raise RemailError("Remail 订单号不能为空")
+    return _unwrap_order(_request("GET", f"/v1/open/orders/{quote(target, safe='')}"))
+
+
+def evaluate_order_dead(detail: dict) -> str | None:
+    """按订单详情判断接码通道是否已终结；返回死因或 None。"""
+    if not isinstance(detail, dict):
+        return "订单详情格式异常"
+    status = str(detail.get("status") or "").strip().lower()
+    if status in _FINAL_ORDER_STATUSES:
+        failure = str(detail.get("failureCode") or detail.get("failure_code") or "").strip()
+        return "Remail 订单已终结: status=" + status + (f", failure={failure}" if failure else "")
+    mode = str(detail.get("serviceMode") or detail.get("service_mode") or "").strip().lower()
+    expired_at = _parse_timestamp(
+        detail.get("expiresAt") or detail.get("expires_at") or detail.get("expireAt")
+    )
+    if mode == "code" and expired_at is not None and expired_at < time.time():
+        return "Remail code 模式订单已过期"
+    return None
+
+
+def probe_pickup_channel(email: str, service_token: str) -> dict:
+    """单次 pickup 探测取码通道；返回 {"ok": bool, "dead": bool, "error": str|None}。
+
+    ``dead=True`` 仅在服务端给出确定性错误（订单不存在/失效/过期）时成立；
+    网络/5xx 等不确定错误返回 ``dead=False`` 交给调用方跳过，避免误杀账号。
+    """
+    target = str(email or "").strip()
+    token = str(service_token or "").strip()
+    if not target or not token:
+        return {"ok": False, "dead": True, "error": "pickup 探测缺少邮箱或 service token"}
+    try:
+        _request(
+            "GET",
+            "/v1/pickup",
+            params={"email": target, "token": token},
+            authenticated=False,
+        )
+    except RemailError as exc:
+        text = str(exc)
+        lowered = text.lower()
+        dead = any(
+            hint in lowered or hint in text
+            for hint in ("404", "not found", "expired", "invalid", "不存在", "过期", "失效", "已终结")
+        )
+        return {"ok": False, "dead": dead, "error": text[:240]}
+    except Exception as exc:
+        return {"ok": False, "dead": False, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    return {"ok": True, "dead": False, "error": None}

@@ -66,6 +66,12 @@ class _DummyQueueSlot:
 
 class AccountLivenessTests(unittest.TestCase):
     def setUp(self):
+        # 本类是协议查活的离线测试；必须把查活驱动锁回 protocol，
+        # 否则 .env 里的 LIVE_CHECK_DRIVER=cloak 会让 _run_live_check 走进
+        # 真实浏览器分支（启动 CloakBrowser、向夹具邮箱触发真实登录）。
+        driver_patch = patch("config.roxybrowser.LIVE_CHECK_DRIVER", "protocol")
+        driver_patch.start()
+        self.addCleanup(driver_patch.stop)
         plan_patch = patch("core.chatgpt_plan.check_account_plan", return_value={"ok": True, "current_plan_type": "plus"})
         self.plan_mock = plan_patch.start()
         self.addCleanup(plan_patch.stop)

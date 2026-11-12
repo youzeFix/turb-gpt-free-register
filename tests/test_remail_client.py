@@ -22,7 +22,7 @@ class RemailClientTests(unittest.TestCase):
         }
         request.return_value = response
 
-        with patch.object(email_config, "REMAIL_API_BASE", "https://remail.aishop6.com/docs", create=True), patch.object(
+        with patch.object(email_config, "REMAIL_API_BASE", "https://remail.best/docs", create=True), patch.object(
             email_config, "REMAIL_API_KEY", "rk-test-key", create=True
         ), patch.object(email_config, "REMAIL_PROJECT_ID", 1001, create=True), patch.object(
             email_config, "REMAIL_EMAIL_SUFFIX", "outlook.com", create=True
@@ -36,7 +36,7 @@ class RemailClientTests(unittest.TestCase):
         self.assertIs(remail_client.get_account_context("FRESH@OUTLOOK.TEST"), account)
         request.assert_called_once()
         args, kwargs = request.call_args
-        self.assertEqual(args[:2], ("POST", "https://remail.aishop6.com/v1/open/orders"))
+        self.assertEqual(args[:2], ("POST", "https://remail.best/v1/open/orders"))
         self.assertEqual(kwargs["params"], {"serviceMode": "code", "supply": "private_first"})
         self.assertEqual(kwargs["json"], {"projectId": 1001, "emailSuffix": "outlook.com"})
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer rk-test-key")
@@ -69,7 +69,7 @@ class RemailClientTests(unittest.TestCase):
         self.assertEqual(account.email, "fresh@outlook.test")
         self.assertEqual(
             request.call_args_list[1].args[:2],
-            ("GET", "https://remail.aishop6.com/v1/open/orders/R20260829123456789"),
+            ("GET", "https://remail.best/v1/open/orders/R20260829123456789"),
         )
 
     @patch("core.remail_client.requests.request")
@@ -114,7 +114,7 @@ class RemailClientTests(unittest.TestCase):
 
         self.assertEqual(code, "654321")
         kwargs = request.call_args.kwargs
-        self.assertEqual(request.call_args.args[:2], ("GET", "https://remail.aishop6.com/v1/pickup"))
+        self.assertEqual(request.call_args.args[:2], ("GET", "https://remail.best/v1/pickup"))
         self.assertEqual(kwargs["params"], {"email": "fresh@outlook.test", "token": "st-test-token"})
         self.assertNotIn("Authorization", kwargs["headers"])
 
@@ -152,7 +152,7 @@ class RemailClientTests(unittest.TestCase):
         self.assertEqual(code, "654321")
         self.assertEqual(
             request.call_args.args[:2],
-            ("GET", "https://remail.aishop6.com/v1/pickup"),
+            ("GET", "https://remail.best/v1/pickup"),
         )
         self.assertEqual(
             request.call_args.kwargs["params"],

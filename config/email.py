@@ -164,11 +164,11 @@ CLOUDMAIL_RANDOM_LOCAL_LENGTH = 12
 
 
 # ============================================================
-# Remail 开放 API：https://remail.aishop6.com/docs
+# Remail 开放 API：https://remail.best/docs
 # ============================================================
 
-# API 根地址；也兼容填写 https://remail.aishop6.com/docs，客户端会自动规范化。
-REMAIL_API_BASE = "https://remail.aishop6.com"
+# API 根地址；也兼容填写 https://remail.best/docs，客户端会自动规范化。
+REMAIL_API_BASE = "https://remail.best"
 
 # Remail 控制台生成的 rk- 开头 API Key。
 REMAIL_API_KEY = env_str("REMAIL_API_KEY", "")

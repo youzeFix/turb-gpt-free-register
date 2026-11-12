@@ -55,6 +55,14 @@ EDITABLE_FIELDS = [
         "label": "注册驱动", "help": "默认推荐 roxy；protocol=纯协议，容易封号不建议；roxy=RoxyBrowser；cloak=CloakBrowser；browser_use=Browser Use Cloud+Playwright；skyvern=Skyvern Browser Sessions+Playwright",
     },
     {
+        "key": "LIVE_CHECK_DRIVER", "file": "roxybrowser.py", "type": "str", "group": "功能开关",
+        "label": "查活驱动", "help": "protocol=纯协议重登录（CF 质询期需住宅出口+cf_cookie_warm 预热）；cloak=CloakBrowser 浏览器重登录（真实浏览器自动通过 CF 质询，出口走代理池，不消耗住宅流量）。保存后新查活任务生效。",
+        "choices": [
+            {"value": "protocol", "label": "纯协议（需住宅出口+预热）"},
+            {"value": "cloak", "label": "CloakBrowser 浏览器（推荐）"},
+        ],
+    },
+    {
         "key": "PROTOCOL_HTTP_CLIENT", "file": "browser.py", "type": "str", "group": "功能开关",
         "label": "纯协议 HTTP 客户端", "help": "curl_cffi / wreq；作用于 BrowserSession（含纯协议注册和后台 2FA），不改变 Roxy 注册。保存后新会话生效；wreq 需要 Python >=3.11。",
         "choices": [
@@ -508,8 +516,8 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "REMAIL_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "Remail API 地址", "help": "默认 https://remail.aishop6.com；也可填写文档地址 https://remail.aishop6.com/docs",
-        "external_url": "https://remail.aishop6.com/register?aff=AFFLGYQMTYIXH",
+        "label": "Remail API 地址", "help": "默认 https://remail.best；也可填写文档地址 https://remail.best/docs",
+        "external_url": "https://remail.best/register?aff=AFFLGYQMTYIXH",
         "external_label": "打开 Remail 官网",
     },
     {
