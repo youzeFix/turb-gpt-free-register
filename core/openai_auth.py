@@ -74,6 +74,11 @@ _ACCOUNT_DEAD_TEXT_MARKERS = (
     "账户已停用",
     "账户已禁用",
     "账户已删除",
+    # OpenAI 页面在不同语言下的废号提示（如 ja-JP 页面）。
+    "アカウントは削除",
+    "アカウントは無効",
+    "アカウントが削除",
+    "account is deactivated",
 )
 
 

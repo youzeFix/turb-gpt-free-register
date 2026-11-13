@@ -115,12 +115,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Remail 接码通道批量体检")
     parser.add_argument("--apply", action="store_true", help="把判定失效的账号标记为 deactivated（默认只报告）")
     parser.add_argument("--account-id", type=int, default=0, help="只体检指定账号")
+    parser.add_argument("--ids", default="", help="逗号分隔的账号 ID 列表（用于复测网络抖动的子集）")
     parser.add_argument("--delay", type=float, default=0.3, help="每账号之间的间隔秒数")
     args = parser.parse_args()
 
     accounts = _load_remail_accounts()
     if args.account_id:
         accounts = [a for a in accounts if int(a.get("id") or 0) == args.account_id]
+    if args.ids:
+        wanted = {int(x) for x in str(args.ids).replace(" ", "").split(",") if x.strip().isdigit()}
+        accounts = [a for a in accounts if int(a.get("id") or 0) in wanted]
     print(f"待体检 Remail 账号: {len(accounts)} 个（apply={args.apply}）")
 
     summary = {"alive": 0, "dead": 0, "unknown": 0}

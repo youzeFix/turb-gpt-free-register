@@ -1163,6 +1163,15 @@ def _locate_otp_input(driver):
     return None
 
 
+def _read_page_text_for_diag(driver) -> str:
+    """读取当前页面可见文本（废号诊断用）；失败返回空串。"""
+    try:
+        return str(driver.execute_script(
+            "return (document.body ? document.body.innerText : '');") or "")
+    except Exception:
+        return ""
+
+
 def _type_otp(driver, code: str) -> None:
     # 页面通常已经停在 /email-verification，只是 React 还没渲染出输入框。
     # 此时刷新会丢弃已到达的页面状态，在慢节点上反而更慢（曾经出现
@@ -1200,6 +1209,17 @@ def _type_otp(driver, code: str) -> None:
         if found and (found[0] == "single" or len(found[1]) >= len(code)):
             kind, els = found
 
+    # 找不到输入框往往不是渲染慢，而是页面本身变成了错误/废号提示页
+    # （例如「アカウントは削除または無効化されているため、ご利用いただけません」）。
+    # 先读页面文本识别废号，避免把这类邮箱当作普通失败释放回邮箱池被反复重试。
+    from core.openai_auth import AccountUnusableError, detect_account_unusable_text
+
+    page_dead_code = detect_account_unusable_text(_read_page_text_for_diag(driver))
+    if page_dead_code:
+        raise AccountUnusableError(
+            f"账号已废（{page_dead_code}）：提交邮箱后页面为废号提示而非验证码页",
+            error_code=page_dead_code,
+        )
     raise RuntimeError(
         f"找不到 OTP 输入框，已刷新重试{_MISSING_PAGE_ELEMENT_REFRESH_RETRIES}次"
     )

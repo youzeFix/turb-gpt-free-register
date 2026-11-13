@@ -168,6 +168,13 @@ def _should_disable_failed_registration_email(error: object) -> bool:
     text = str(error or "")
     if not text:
         return False
+    # 页面为废号提示（含日文「アカウントは削除/無効」等）时，该邮箱在
+    # OpenAI 侧已被标记，绝不能释放回邮箱池，否则会被 pending 任务
+    # 反复领取形成死循环。
+    from core.openai_auth import detect_account_unusable_text
+
+    if detect_account_unusable_text(text):
+        return True
     return (
         _is_final_session_access_token_timeout(text)
         or "邮箱提交后进入登录密码页" in text
