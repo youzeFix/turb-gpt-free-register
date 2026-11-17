@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 邮箱来源调度层。
 
@@ -18,7 +18,9 @@ EMAIL_SOURCE 支持单个或多个来源：
     ["outlook", "generic_api", "mailnest", "cloudmail", "remail", "xigua"]  # 也兼容列表写法
 """
 import logging
-from typing import Iterable
+import threading
+import time
+from typing import Callable, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +215,74 @@ def _registered_email_source(email: str) -> str | None:
     return _normalize_explicit_email_source((account or {}).get("email_source"))
 
 
+class EmailSuffixBlockedError(RuntimeError):
+    """同一邮箱后缀连续多次收不到验证码：疑似被 OpenAI 封控，跳过等待。
+
+    后缀级熔断：比如 outlook.com 被 OpenAI 风控不达验证码时，同后缀账号
+    反复等 180 秒没有意义；达到阈值后同后缀账号立即快速失败，批次推进到
+    能收码的后缀（如 icloud）。后续窗口内收到过验证码会自动解除。
+    """
+
+
+_SUFFIX_BLOCK_THRESHOLD = 4
+_SUFFIX_BLOCK_WINDOW_SECONDS = 15 * 60
+_SUFFIX_OTP_FAILS: dict[str, list[float]] = {}
+_SUFFIX_FAILS_LOCK = threading.Lock()
+
+
+def _email_suffix(email: str) -> str:
+    return str(email or "").strip().rsplit("@", 1)[-1].strip().lower()
+
+
+def _suffix_fail_count(suffix: str) -> int:
+    now = time.time()
+    with _SUFFIX_FAILS_LOCK:
+        stamps = [t for t in _SUFFIX_OTP_FAILS.get(suffix, []) if now - t < _SUFFIX_BLOCK_WINDOW_SECONDS]
+        _SUFFIX_OTP_FAILS[suffix] = stamps
+        return len(stamps)
+
+
+def _record_suffix_fail(suffix: str) -> int:
+    now = time.time()
+    with _SUFFIX_FAILS_LOCK:
+        stamps = [t for t in _SUFFIX_OTP_FAILS.get(suffix, []) if now - t < _SUFFIX_BLOCK_WINDOW_SECONDS]
+        stamps.append(now)
+        _SUFFIX_OTP_FAILS[suffix] = stamps
+        return len(stamps)
+
+
+def _clear_suffix_fails(suffix: str) -> None:
+    with _SUFFIX_FAILS_LOCK:
+        _SUFFIX_OTP_FAILS.pop(suffix, None)
+
+
+def _fetch_otp_with_suffix_breaker(email: str, source: str, fetch: Callable[..., str], extra_kwargs: dict, after_ts: float) -> str:
+    """带后缀熔断的 OTP 获取。
+
+    进入时该后缀近期失败次数达到阈值则立即抛 EmailSuffixBlockedError，
+    不再空等；等待成功会清零该后缀的失败记录。
+    """
+    suffix = _email_suffix(email)
+    fails = _suffix_fail_count(suffix)
+    if fails >= _SUFFIX_BLOCK_THRESHOLD:
+        raise EmailSuffixBlockedError(
+            f"邮箱后缀 {suffix} 近 {_SUFFIX_BLOCK_WINDOW_SECONDS // 60} 分钟内已连续 {fails} 次"
+            "收不到验证码（疑似被 OpenAI 封控），跳过本账号的 OTP 等待"
+        )
+    try:
+        code = fetch(email, after_ts=after_ts, **extra_kwargs)
+    except Exception as exc:
+        count = _record_suffix_fail(suffix)
+        if count >= _SUFFIX_BLOCK_THRESHOLD:
+            raise type(exc)(
+                f"{exc}；[后缀熔断] {suffix} 已连续 {count} 次收不到验证码，"
+                f"同后缀后续账号将跳过 OTP 等待"
+            ) from exc
+        raise
+    _clear_suffix_fails(suffix)
+    return code
+
+
 def wait_for_otp(
     email: str,
     after_ts: float,
@@ -262,36 +332,36 @@ def wait_for_otp(
     )
     if source == "gptmail":
         from core.gptmail_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+        return _fetch_otp_with_suffix_breaker(email, source, fetch_latest_otp, extra_kwargs, after_ts)
     if source == "cloudflare":
         from core.cf_temp_mail_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+        return _fetch_otp_with_suffix_breaker(email, source, fetch_latest_otp, extra_kwargs, after_ts)
     if source == "cloudflare_domain":
         from core.qqmail_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+        return _fetch_otp_with_suffix_breaker(email, source, fetch_latest_otp, extra_kwargs, after_ts)
     if source == "generic_api":
         from core.generic_api_mail_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+        return _fetch_otp_with_suffix_breaker(email, source, fetch_latest_otp, extra_kwargs, after_ts)
     if source == "imap":
         from core.imap_mail_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+        return _fetch_otp_with_suffix_breaker(email, source, fetch_latest_otp, extra_kwargs, after_ts)
     if source == "mailnest":
         from core.mailnest_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+        return _fetch_otp_with_suffix_breaker(email, source, fetch_latest_otp, extra_kwargs, after_ts)
     if source == "cloudmail":
         from core.cloudmail_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+        return _fetch_otp_with_suffix_breaker(email, source, fetch_latest_otp, extra_kwargs, after_ts)
     if source == "remail":
         from core.remail_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+        return _fetch_otp_with_suffix_breaker(email, source, fetch_latest_otp, extra_kwargs, after_ts)
     if source == "mailcode":
         from core.mailcode_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+        return _fetch_otp_with_suffix_breaker(email, source, fetch_latest_otp, extra_kwargs, after_ts)
     if source == "xigua":
         from core.xigua_client import fetch_latest_otp
-        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+        return _fetch_otp_with_suffix_breaker(email, source, fetch_latest_otp, extra_kwargs, after_ts)
     from core.outlook_client import fetch_latest_otp
-    return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+    return _fetch_otp_with_suffix_breaker(email, source, fetch_latest_otp, extra_kwargs, after_ts)
 
 
 def email_material_line(email: str, source: str | None = None) -> str:

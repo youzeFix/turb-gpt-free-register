@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """CloakBrowser 浏览器查活（core/cloakbrowser_liveness.py）离线测试。"""
 import unittest
 from unittest.mock import MagicMock, patch
@@ -40,7 +40,6 @@ class RunCloakLivenessTests(unittest.TestCase):
              patch.object(liveness, "_submit_login_email"), \
              patch.object(liveness, "_fill_login_password_if_present", return_value="next_step"), \
              patch.object(liveness, "_fetch_chatgpt_session", return_value=_session_info()), \
-             patch.object(liveness, "BrowserDataSaver"), \
              patch.object(liveness, "build_cloak_driver", return_value=(driver, opened)):
             result = liveness.run_cloak_liveness("a@b.c", proxy="http://127.0.0.1:7897")
         self.assertTrue(result["ok"])
@@ -62,7 +61,6 @@ class RunCloakLivenessTests(unittest.TestCase):
             _fill_login_password_if_present=MagicMock(return_value="email_otp"),
             _submit_email_otp=MagicMock(),
             _fetch_chatgpt_session=MagicMock(return_value=_session_info()),
-            BrowserDataSaver=MagicMock(),
         ), patch.object(liveness, "build_cloak_driver", return_value=(driver, opened)):
             result = liveness.run_cloak_liveness("a@b.c", on_authenticated=on_authenticated)
         self.assertTrue(result["plan_result"]["ok"])
@@ -76,7 +74,6 @@ class RunCloakLivenessTests(unittest.TestCase):
             _submit_login_email=MagicMock(),
             _fill_login_password_if_present=MagicMock(return_value="email_otp"),
             _submit_email_otp=MagicMock(side_effect=RuntimeError("邮箱 OTP 等待超时")),
-            BrowserDataSaver=MagicMock(),
         ), patch.object(liveness, "build_cloak_driver", return_value=(driver, opened)):
             result = liveness.run_cloak_liveness("a@b.c")
         self.assertFalse(result["ok"])
@@ -92,7 +89,6 @@ class RunCloakLivenessTests(unittest.TestCase):
             _submit_login_email=MagicMock(),
             _fill_login_password_if_present=MagicMock(return_value="email_otp"),
             _submit_email_otp=MagicMock(side_effect=AccountUnusableError("账号已废", error_code="account_deactivated")),
-            BrowserDataSaver=MagicMock(),
         ), patch.object(liveness, "build_cloak_driver", return_value=(driver, opened)):
             result = liveness.run_cloak_liveness("a@b.c")
         self.assertEqual(result["status"], "deactivated")
@@ -106,7 +102,6 @@ class RunCloakLivenessTests(unittest.TestCase):
             _submit_login_email=MagicMock(),
             _fill_login_password_if_present=MagicMock(return_value="next_step"),
             _fetch_chatgpt_session=MagicMock(return_value={"accessToken": ""}),
-            BrowserDataSaver=MagicMock(),
         ), patch.object(liveness, "build_cloak_driver", return_value=(driver, opened)):
             result = liveness.run_cloak_liveness("a@b.c")
         self.assertEqual(result["status"], "failed")

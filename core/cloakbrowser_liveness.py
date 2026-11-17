@@ -23,7 +23,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from core.browser_data_saver import BrowserDataSaver
 from core.cloakbrowser_driver import build_cloak_driver
 from core.email_provider import wait_for_otp
 from core.humanize import delay as human_delay
@@ -71,6 +70,141 @@ _LOGIN_ERROR_MARKERS = (
     "something went wrong", "エラー", "出错", "try again later",
 )
 
+_CHALLENGE_MARKERS = (
+    "just a moment", "challenge-platform", "确认您是真人",
+    "verify you are human", "しばらくお待ちください",
+)
+
+
+def _challenge_state(driver) -> str:
+    """返回当前页面标题+正文（质询检测用）；读取失败返回空串。"""
+    try:
+        return str(driver.execute_script(
+            "return (document.title || '') + '\\n' + "
+            "(document.body ? document.body.innerText.slice(0, 2000) : '');") or "")
+    except Exception:
+        return ""
+
+
+def _looks_challenged(driver) -> bool:
+    text = _challenge_state(driver)
+    if not text:
+        return False
+    low = text.lower()
+    return any(m in low or m in text for m in _CHALLENGE_MARKERS)
+
+
+def _page_blank(driver) -> bool:
+    """隐形质询形态：页面正文为空/极短且没有邮箱输入框。
+
+    CF 有时把质询嵌进主文档（title 仍是 ChatGPT、无 iframe、无 marker 文本），
+    显式特征检测会漏过；此时把“长时间空白无表单”当作质询信号处理。
+    """
+    try:
+        state = driver.execute_script(r"""
+            return {
+              text: (document.body ? document.body.innerText : '').trim(),
+              hasInput: !!document.querySelector('input'),
+            };
+        """) or {}
+    except Exception:
+        return False
+    if not isinstance(state, dict):
+        return False
+    # 任何输入框（email/otp/tel 等）都说明页面已渲染真实表单，不是空白质询页。
+    return len(str(state.get("text") or "")) < 30 and not state.get("hasInput")
+
+
+def _click_main_document_checkbox(driver) -> str:
+    """点击主文档里的复选框（非 iframe 形态的 Turnstile）。"""
+    page = getattr(driver, "page", None)
+    if page is None:
+        return ""
+    try:
+        for selector in ("input[type='checkbox']", "[role='checkbox']", "label"):
+            loc = page.locator(selector).first
+            try:
+                if loc.is_visible(timeout=800):
+                    loc.click(timeout=1500)
+                    return f"main-doc:{selector}"
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ""
+
+
+def _maybe_click_turnstile(driver) -> str:
+    """尝试点击 CF 交互式质询里的 Turnstile 复选框；返回点击方式。"""
+    page = getattr(driver, "page", None)
+    if page is None:
+        return ""
+    try:
+        for frame_handle in page.query_selector_all("iframe"):
+            src = (frame_handle.get_attribute("src") or "")
+            if "challenges.cloudflare.com" not in src:
+                continue
+            try:
+                frame = frame_handle.content_frame()
+                if frame is not None:
+                    checkbox = frame.locator("input[type='checkbox'], [role='checkbox']").first
+                    checkbox.click(timeout=2000)
+                    return "checkbox"
+            except Exception:
+                pass
+            box = frame_handle.bounding_box()
+            if box:
+                page.mouse.click(
+                    box["x"] + box["width"] / 2,
+                    box["y"] + min(box["height"] / 2, max(10.0, box["height"] - 8.0)),
+                )
+                return "center"
+    except Exception:
+        pass
+    return ""
+
+
+def _ensure_challenge_cleared(driver, email: str, *, max_wait: float = 240.0) -> bool:
+    """等待 CF 质询解决：自动点击 Turnstile（iframe 与主文档形态），点不动时
+    提示手动点击；空壳页（隐形质询）则连续确认后重新导航。返回是否出现过质询。
+    """
+    start = time.time()
+    handled = False
+    hinted = False
+    last_click = 0.0
+    blank_streak = 0
+    while time.time() - start < max_wait:
+        explicit = _looks_challenged(driver)
+        blank = _page_blank(driver) if not explicit else False
+        if not explicit and not blank:
+            if handled:
+                logger.info("[Cloak查活] CF 质询已通过（%s）：%s",
+                            f"{time.time() - start:.0f}s", email)
+            return handled
+        handled = True
+        elapsed = time.time() - start
+        if elapsed > 20 and not hinted:
+            logger.warning(
+                "[Cloak查活] %s 遇到 CF 人机验证（%s）；自动点击复选框中，"
+                "如 15 秒后仍停留验证页，请手动在弹出的浏览器窗口点击『确认您是真人』",
+                email, "交互式质询页" if explicit else "空白隐形质询页")
+            hinted = True
+        if elapsed > 25 and time.time() - last_click > 8:
+            clicked = _maybe_click_turnstile(driver) or _click_main_document_checkbox(driver)
+            if clicked:
+                last_click = time.time()
+                logger.info("[Cloak查活] 已点击质询复选框（%s）：%s", clicked, email)
+        if blank and not explicit:
+            # 空壳页连续两次确认（间隔一个轮询周期）才算隐形质询，避免误判加载中。
+            blank_streak += 1
+            if blank_streak >= 2:
+                logger.info("[Cloak查活] 页面持续空白，判定为隐形质询，重新导航登录入口")
+                return handled
+        else:
+            blank_streak = 0
+        time.sleep(3)
+    return handled
+
 
 def _read_page_error(driver) -> str:
     """读取登录页可见文本；用于快速发现"登录失败"类页面错误。"""
@@ -94,11 +228,26 @@ def _page_login_error(driver) -> str:
 
 
 def _submit_login_email(driver, email: str, *, timeout: float = 60.0) -> None:
-    """等待 chatgpt.com/auth/login 跳转到 auth 域并出现邮箱表单，然后提交。"""
+    """等待 chatgpt.com/auth/login 跳转到 auth 域并出现邮箱表单，然后提交。
+
+    提交前如遇 CF 交互式质询会自动点击 Turnstile（并提示手动兜底）。
+    """
     end = time.time() + timeout
     last_error = ""
     while time.time() < end:
         _check_manual_stop()
+        # 登录页被 Turnstile 拦截时先处理质询，再尝试填邮箱。
+        try:
+            if _ensure_challenge_cleared(driver, email, max_wait=240.0):
+                # 质询会打断 NextAuth 重定向链；解决后必须重新导航登录入口，
+                # 否则页面停在 chatgpt.com/auth/login 原地，永远没有邮箱表单。
+                logger.info("[Cloak查活] 质询已解决，重新打开登录入口")
+                driver.get(_LOGIN_ENTRY_URL)
+                human_delay("navigate")
+                _maybe_accept(driver)
+                end = time.time() + timeout  # 质询解决后重新计时
+        except Exception:
+            logger.debug("[Cloak查活] 质询处理异常，继续尝试表单", exc_info=True)
         try:
             _type_email_address(driver, email, timeout=8)
             human_delay("form")
@@ -121,6 +270,12 @@ def _submit_email_otp(driver, email: str, *, max_attempts: int = 3) -> None:
     form_deadline = time.time() + 75
     while time.time() < form_deadline:
         _check_manual_stop()
+        # OTP 页也可能被插入 Turnstile 质询，先处理再等输入框。
+        try:
+            if _ensure_challenge_cleared(driver, email, max_wait=240.0):
+                form_deadline = time.time() + 75  # 质询解决后重新计时
+        except Exception:
+            logger.debug("[Cloak查活] 质询处理异常，继续等待表单", exc_info=True)
         page_error = _page_login_error(driver)
         if page_error:
             raise RuntimeError(
@@ -196,11 +351,9 @@ def run_cloak_liveness(
     driver = None
     try:
         driver, opened = build_cloak_driver(proxy=proxy)
-        try:
-            data_saver = BrowserDataSaver(label="Cloak查活")
-            data_saver.install_playwright(driver.context)
-        except Exception:
-            logger.debug("[Cloak查活] 省流量拦截器安装失败，继续登录", exc_info=True)
+        # 查活不安装 BrowserDataSaver：省流量拦截会把 CF 质询页渲染成空壳
+        # （challenge 脚本被拦，质询检测与自动点击全部失效）。查活流量走
+        # clash 免费，省流量在这里没有收益，只有副作用。
 
         logger.info(
             "[Cloak查活] 开始：%s profile=%s proxy=%s",
