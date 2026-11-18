@@ -231,21 +231,34 @@ def _submit_login_email(driver, email: str, *, timeout: float = 60.0) -> None:
     """等待 chatgpt.com/auth/login 跳转到 auth 域并出现邮箱表单，然后提交。
 
     提交前如遇 CF 交互式质询会自动点击 Turnstile（并提示手动兜底）。
+    空白隐形质询允许重新导航最多 3 次；超限说明当前出口/时段 CF 持续
+    挂质询，放弃本账号（failed 可重试），避免无限循环占死 worker。
     """
     end = time.time() + timeout
     last_error = ""
+    renav_count = 0
+    MAX_RENAVS = 3
     while time.time() < end:
         _check_manual_stop()
         # 登录页被 Turnstile 拦截时先处理质询，再尝试填邮箱。
         try:
             if _ensure_challenge_cleared(driver, email, max_wait=240.0):
+                if renav_count >= MAX_RENAVS:
+                    raise RuntimeError(
+                        f"登录入口持续被 CF 质询拦截（空白隐形质询），已重新导航 "
+                        f"{renav_count} 次仍无表单，放弃本账号（可稍后重试）"
+                    )
                 # 质询会打断 NextAuth 重定向链；解决后必须重新导航登录入口，
                 # 否则页面停在 chatgpt.com/auth/login 原地，永远没有邮箱表单。
-                logger.info("[Cloak查活] 质询已解决，重新打开登录入口")
+                renav_count += 1
+                logger.info("[Cloak查活] 质询已解决，重新打开登录入口（第 %s/%s 次）",
+                            renav_count, MAX_RENAVS)
                 driver.get(_LOGIN_ENTRY_URL)
                 human_delay("navigate")
                 _maybe_accept(driver)
                 end = time.time() + timeout  # 质询解决后重新计时
+        except RuntimeError:
+            raise
         except Exception:
             logger.debug("[Cloak查活] 质询处理异常，继续尝试表单", exc_info=True)
         try:
